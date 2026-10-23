@@ -2,13 +2,14 @@
 
 A three-machine LAN e-commerce discovery and recommendation research project. **SQLite is the default business database**; PostgreSQL can be selected by configuration. Gorse maintains a *separate* PostgreSQL data store, because Gorse does not support SQLite as its data store.
 
-> **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
+> **V1.5 migrations and live catalog updates:** [docs/ITERATION_V1_5.md](docs/ITERATION_V1_5.md). Prior **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
 ## Features
 
 - Next.js storefront with product browsing, search, category filters, details and demo cart.
 - FastAPI commerce API, SQLAlchemy models, session-based anonymous visitors, SQLite WAL and PostgreSQL mode.
 - OpenSearch-backed product search with SQLite FTS5 / SQL LIKE degradation; Gorse distributed recommendations with local-interest/popularity fallback.
+- Alembic schema versioning on production startup and a separate durable OpenSearch incremental-update sidecar.
 - Atomic raw-event + outbox persistence, batched Gorse integration, Amazon Reviews 2023 product metadata and optional positive review-history import.
 - Separate Compose configurations for Ubuntu A (storage/search/master), Ubuntu B (worker/server), and macOS (web/API).
 
@@ -70,6 +71,8 @@ docker compose --env-file .env -f infra/macos/compose.yaml exec api python /app/
 # sync a batch of durable outbox messages
 curl -X POST -H "X-Admin-Key: $ADMIN_KEY" 'http://127.0.0.1:8000/api/admin/sync?batch=1000'
 ```
+
+The Mac Compose file runs `migrate` before the API, then separate `sync` (Gorse) and `search-sync` (OpenSearch) sidecars. See the [V1.5 upgrade notes](docs/ITERATION_V1_5.md) before a full alias rebuild.
 
 The Mac Compose file runs a `sync` sidecar that drains successful backlog batches rapidly, then checks again after an idle pause. Use `docker compose -f infra/macos/compose.yaml logs -f sync` to inspect failures. Gorse offline models refresh periodically, while the API also reranks learned candidates using current-session category interest. Recommendations include an attributed slate ID; impression events are recorded only when cards enter the viewport.
 

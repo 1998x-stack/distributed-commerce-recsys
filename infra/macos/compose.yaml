@@ -8,9 +8,29 @@ services:
     command: ["sh", "-c", "chown -R 10001:10001 /data"]
     volumes: ["commerce_data:/data"]
     restart: "no"
-  api:
+  migrate:
     depends_on:
       volume-init: {condition: service_completed_successfully}
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    restart: "no"
+    environment:
+      DB_DRIVER: ${DB_DRIVER:-sqlite}
+      SQLITE_PATH: /app/data/commerce.db
+      DATABASE_URL_POSTGRES: ${DATABASE_URL_POSTGRES:-}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
+      APP_ENV: production
+    command: ["alembic", "upgrade", "head"]
+    volumes: ["commerce_data:/app/data"]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+  api:
+    depends_on:
+      migrate: {condition: service_completed_successfully}
     build:
       context: ../..
       dockerfile: services/api/Dockerfile
@@ -19,6 +39,7 @@ services:
       DB_DRIVER: ${DB_DRIVER:-sqlite}
       SQLITE_PATH: /app/data/commerce.db
       DATABASE_URL_POSTGRES: ${DATABASE_URL_POSTGRES:-}
+      SCHEMA_MODE: external
       OPENSEARCH_URL: http://${UBUNTU_A_IP:?Set UBUNTU_A_IP}:9200
       GORSE_URL: http://${UBUNTU_B_IP:?Set UBUNTU_B_IP}:8087
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
@@ -55,6 +76,24 @@ services:
       API_URL: http://api:8000
       ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
     command: ["python", "/app/scripts/sync_gorse.py"]
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging:
+      options: {max-size: "10m", max-file: "3"}
+  search-sync:
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api: {condition: service_healthy}
+    environment:
+      API_URL: http://api:8000
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
+    command: ["python", "/app/scripts/sync_search.py"]
     init: true
     read_only: true
     tmpfs: [/tmp]

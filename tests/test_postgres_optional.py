@@ -3,6 +3,8 @@ import importlib.util
 import os
 import sys
 import uuid
+import subprocess
+from sqlalchemy import text
 from pathlib import Path
 import pytest
 
@@ -25,6 +27,12 @@ def test_postgres_business_mode(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
     try:
         mod.Base.metadata.drop_all(mod.engine)
+        with mod.engine.begin() as conn:
+            conn.execute(text('DROP TABLE IF EXISTS alembic_version'))
+        # Exercise the actual PostgreSQL migration rather than create_all in the API.
+        subprocess.run([sys.executable, '-m', 'alembic', 'upgrade', 'head'],
+                       cwd=Path(__file__).resolve().parents[1], check=True)
+        monkeypatch.setenv('SCHEMA_MODE', 'external')
         with TestClient(mod.app) as client:
             with mod.SessionLocal() as db:
                 db.add(mod.Product(id='test:pg-product', title='PG item', category='PG', rating=4.5))
@@ -38,6 +46,8 @@ def test_postgres_business_mode(tmp_path, monkeypatch):
                           'event_type': 'click'}).status_code == 201
             assert client.get('/api/recommendations/home').status_code == 200
         mod.Base.metadata.drop_all(mod.engine)
+        with mod.engine.begin() as conn:
+            conn.execute(text('DROP TABLE IF EXISTS alembic_version'))
     finally:
         mod.engine.dispose()
         sys.modules.pop(name, None)

@@ -178,9 +178,8 @@ class CartInput(BaseModel):
     quantity: int = Field(default=1, ge=1, le=20)
 
 
-def initialize_schema():
-    """Backward-compatible V1 additive upgrade. Use Alembic for future changes."""
-    Base.metadata.create_all(engine)
+def upgrade_existing_schema(conn):
+    """Idempotently reconcile legacy V1..V1.4 schema during the Alembic baseline."""
     required = {
         'next_attempt_at': 'TIMESTAMP',
         'lease_owner': 'VARCHAR(36)',
@@ -189,25 +188,46 @@ def initialize_schema():
         'created_at': 'TIMESTAMP',
         'delivered_at': 'TIMESTAMP',
     }
+    # Existing V1 databases created before the composite index need it too.
+    existing_indexes = {idx['name'] for idx in inspect(conn).get_indexes('events')}
+    if 'ix_events_visitor_at' not in existing_indexes:
+        conn.execute(text('CREATE INDEX ix_events_visitor_at ON events (visitor, at)'))
+    columns = {col['name'] for col in inspect(conn).get_columns('products')}
+    if 'rating_count' not in columns:
+        conn.execute(text('ALTER TABLE products ADD COLUMN rating_count INTEGER NOT NULL DEFAULT 0'))
+    columns = {col['name'] for col in inspect(conn).get_columns('outbox')}
+    for name, datatype in required.items():
+        if name not in columns:
+            conn.execute(text(f'ALTER TABLE outbox ADD COLUMN {name} {datatype}'))
+    # An index on the existing table must be added explicitly; create_all
+    # only creates indexes automatically when the table is new.
+    conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_created_at ON outbox (created_at)'))
+    conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_claim ON outbox (delivered, next_attempt_at, lease_until)'))
+    conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_delivered_at ON outbox (delivered, delivered_at)'))
+    # create_all does not add indexes to pre-existing tables.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(bind=conn, checkfirst=True)
+    if conn.dialect.name == 'sqlite':
+        install_sqlite_fts(conn)
+
+
+def initialize_schema():
+    """Development/test convenience. Production must run Alembic externally."""
     with engine.begin() as conn:
-        # Existing V1 databases created before the composite index need it too.
-        existing_indexes = {idx['name'] for idx in inspect(conn).get_indexes('events')}
-        if 'ix_events_visitor_at' not in existing_indexes:
-            conn.execute(text('CREATE INDEX ix_events_visitor_at ON events (visitor, at)'))
-        columns = {col['name'] for col in inspect(conn).get_columns('products')}
-        if 'rating_count' not in columns:
-            conn.execute(text('ALTER TABLE products ADD COLUMN rating_count INTEGER NOT NULL DEFAULT 0'))
-        columns = {col['name'] for col in inspect(conn).get_columns('outbox')}
-        for name, datatype in required.items():
-            if name not in columns:
-                conn.execute(text(f'ALTER TABLE outbox ADD COLUMN {name} {datatype}'))
-        # An index on the existing table must be added explicitly; create_all
-        # only creates indexes automatically when the table is new.
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_created_at ON outbox (created_at)'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_claim ON outbox (delivered, next_attempt_at, lease_until)'))
-        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_delivered_at ON outbox (delivered, delivered_at)'))
-        if DRIVER == 'sqlite':
-            install_sqlite_fts(conn)
+        Base.metadata.create_all(bind=conn)
+        upgrade_existing_schema(conn)
+
+
+def check_schema_revision():
+    """Reject stale/uncertified schemas instead of migrating from API workers."""
+    with engine.connect() as conn:
+        try:
+            version = conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one()
+        except Exception as exc:
+            raise RuntimeError('Database not migrated; run `alembic upgrade head` first') from exc
+        if version != '0001_v15_baseline':
+            raise RuntimeError(f'Expected schema 0001_v15_baseline, found {version!r}; run Alembic')
 
 
 def install_sqlite_fts(conn):
@@ -261,7 +281,10 @@ def product_quality(p: Product) -> float:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    initialize_schema()
+    if os.getenv('SCHEMA_MODE', 'auto') == 'external':
+        check_schema_revision()
+    else:
+        initialize_schema()
     # One connection pool shared by all synchronous FastAPI workers. Endpoints
     # use normal `def` handlers so SQLAlchemy and HTTP network I/O run in
     # FastAPI's threadpool rather than blocking the event loop.
@@ -350,6 +373,12 @@ def as_product(p: Product, detail: bool = False) -> dict:
         result['description'] = p.description
         result['rating_count'] = p.rating_count
     return result
+
+
+def search_document(product: Product) -> dict:
+    """Canonical OpenSearch product shape; keep batch and full-build mappings aligned."""
+    return {'id': product.id, **{name: getattr(product, name) for name in
+            ('title', 'description', 'brand', 'category', 'price', 'rating', 'source')}}
 
 
 def ensure_product(db: Session, pid: str) -> Product:
@@ -713,6 +742,8 @@ def metrics(db: Session = Depends(db_session)):
         oldest = oldest.replace(tzinfo=timezone.utc)
     age_seconds = max(0, int((datetime.now(timezone.utc) - oldest).total_seconds())) if oldest else None
     return {'products': db.scalar(select(func.count()).select_from(Product)),
+            'search_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind == 'search', Outbox.delivered.is_(False))),
+            'gorse_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind.in_(['item', 'feedback']), Outbox.delivered.is_(False))),
             'events': db.scalar(select(func.count()).select_from(Event)),
             'pending_outbox': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False))),
             'oldest_pending_seconds': age_seconds,
@@ -729,7 +760,7 @@ def sync(request: Request, batch: int = Query(200, ge=1, le=1000), db: Session =
     owner = str(uuid.uuid4())
     available = ((Outbox.lease_until.is_(None)) | (Outbox.lease_until < now))
     due = ((Outbox.next_attempt_at.is_(None)) | (Outbox.next_attempt_at <= now))
-    pending = select(Outbox.id).where(Outbox.delivered.is_(False), available, due).order_by(Outbox.created_at, Outbox.id).limit(batch)
+    pending = select(Outbox.id).where(Outbox.kind.in_(['item', 'feedback']), Outbox.delivered.is_(False), available, due).order_by(Outbox.created_at, Outbox.id).limit(batch)
     # Atomic compare-and-swap lease works with SQLite >=3.35 and PostgreSQL.
     claimed = db.execute(update(Outbox)
         .where(Outbox.id.in_(pending), Outbox.delivered.is_(False), available, due)
@@ -777,7 +808,7 @@ def sync(request: Request, batch: int = Query(200, ge=1, le=1000), db: Session =
         # Only the current owner may ACK. This protects an item that was reimported mid-flight.
         db.execute(update(Outbox).where(Outbox.id == row_id, Outbox.lease_owner == owner).values(**values))
     db.commit()
-    remaining = db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False)))
+    remaining = db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False), Outbox.kind.in_(['item', 'feedback'])))
     return {'claimed': len(claimed), 'delivered': sent, 'failed': failures, 'remaining': remaining}
 
 
@@ -790,3 +821,76 @@ def prune_outbox(days: int = Query(30, ge=1, le=3650),
     deleted = db.query(Outbox).filter(Outbox.id.in_(old_ids)).delete(synchronize_session=False)
     db.commit()
     return {'deleted': deleted, 'retention_days': days}
+
+
+@app.post('/api/admin/search/sync', dependencies=[Depends(admin_key)])
+def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
+                db: Session = Depends(db_session)):
+    """Deliver durable catalog mutations to the current OpenSearch write alias.
+
+    Concurrent import and full alias promotion need coordinated maintenance; see
+    docs/ITERATION_V1_5.md. Unsuccessful and partial bulk responses remain queued.
+    """
+    base = CONFIG['services']['search'].rstrip('/')
+    if not base:
+        raise HTTPException(503, 'OPENSEARCH_URL not configured')
+    now = datetime.now(timezone.utc)
+    owner = str(uuid.uuid4())
+    available = or_(Outbox.lease_until.is_(None), Outbox.lease_until < now)
+    due = or_(Outbox.next_attempt_at.is_(None), Outbox.next_attempt_at <= now)
+    pending = (select(Outbox.id).where(Outbox.kind == 'search', Outbox.delivered.is_(False),
+                                     available, due).order_by(Outbox.created_at, Outbox.id).limit(batch))
+    claimed = db.execute(update(Outbox).where(Outbox.id.in_(pending), Outbox.kind == 'search',
+                        Outbox.delivered.is_(False), available, due)
+                        .values(lease_owner=owner, lease_until=now + timedelta(minutes=5))
+                        .returning(Outbox.id)).scalars().all()
+    db.commit()
+    rows = db.scalars(select(Outbox).where(Outbox.id.in_(claimed)).order_by(Outbox.created_at, Outbox.id)).all() if claimed else []
+    results: list[tuple[str, bool, str]] = []
+    for start in range(0, len(rows), 100):
+        chunk = rows[start:start + 100]
+        try:
+            docs = [json.loads(row.payload) for row in chunk]
+            ndjson = []
+            for doc in docs:
+                identifier = doc.get('id')
+                if not identifier:
+                    raise ValueError('Missing search document id')
+                ndjson.append(json.dumps({'index': {'_index': 'commerce-products', '_id': identifier}}))
+                ndjson.append(json.dumps({k: v for k, v in doc.items() if k != 'id'}, ensure_ascii=False))
+            resp = request.app.state.provider_http.post(
+                base + '/_bulk', content='\n'.join(ndjson) + '\n',
+                headers={'Content-Type': 'application/x-ndjson'}, timeout=20)
+            resp.raise_for_status()
+            result = resp.json()
+            if not isinstance(result, dict):
+                raise ValueError('Malformed OpenSearch bulk response')
+            items = result.get('items')
+            if not isinstance(items, list) or len(items) != len(chunk):
+                raise ValueError('Malformed OpenSearch bulk response')
+            for row, item in zip(chunk, items):
+                status = item.get('index', {})
+                code = status.get('status', 0) if isinstance(status, dict) else 0
+                success = isinstance(code, int) and 200 <= code < 300 and not status.get('error')
+                results.append((row.id, success, '' if success else str(status.get('error', status))[:512]))
+        except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+            results.extend((row.id, False, str(exc)[:512]) for row in chunk)
+    by_id = {row.id: row for row in rows}
+    sent = failed = 0
+    for row_id, ok, error in results:
+        values = {'lease_owner': None, 'lease_until': None}
+        if ok:
+            values.update(delivered=True, delivered_at=datetime.now(timezone.utc), last_error=None)
+        else:
+            attempts = (by_id[row_id].attempts or 0) + 1
+            values.update(attempts=attempts, last_error=error,
+                          next_attempt_at=now + timedelta(seconds=min(1800, 2 ** min(attempts, 10))))
+        ack = db.execute(update(Outbox).where(Outbox.id == row_id, Outbox.lease_owner == owner)
+                         .values(**values))
+        if ack.rowcount:
+            sent += int(ok)
+            failed += int(not ok)
+    db.commit()
+    remaining = db.scalar(select(func.count()).select_from(Outbox).where(
+        Outbox.kind == 'search', Outbox.delivered.is_(False)))
+    return {'claimed': len(claimed), 'delivered': sent, 'failed': failed, 'remaining': remaining}

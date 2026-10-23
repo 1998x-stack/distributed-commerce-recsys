@@ -4,6 +4,7 @@ Usage: PYTHONPATH=services/api python scripts/import_products.py --demo
        PYTHONPATH=services/api python scripts/import_products.py --file meta_Electronics.jsonl.gz --limit 10000
 """
 import argparse
+import os
 import gzip
 import math
 import json
@@ -14,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Product, Outbox, SessionLocal, initialize_schema  # noqa: E402
+from app import Product, Outbox, SessionLocal, initialize_schema, check_schema_revision, search_document  # noqa: E402
 
 DEMO = [
  ('Wireless Studio Headphones', 'Audio', 'Novus', 79.95), ('Compact Bluetooth Earbuds', 'Audio', 'Sonora', 49.90),
@@ -69,7 +70,10 @@ def normalize(raw, index, demo=False):
 
 
 def import_rows(rows, limit, demo=False):
-    initialize_schema()
+    if os.getenv('SCHEMA_MODE') == 'external':
+        check_schema_revision()
+    else:
+        initialize_schema()
     inserted = 0
     with SessionLocal() as db:
         for i, raw in enumerate(rows):
@@ -97,12 +101,27 @@ def import_rows(rows, limit, demo=False):
                 record.next_attempt_at = None
                 record.attempts = 0
                 record.last_error = None
+            # Track catalog mutations separately from Gorse's feedback queue.
+            search_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'search-item-' + product.id))
+            search_payload = json.dumps(search_document(product), sort_keys=True, ensure_ascii=False)
+            search_row = db.get(Outbox, search_id)
+            if search_row is None:
+                db.add(Outbox(id=search_id, kind='search', payload=search_payload))
+            elif search_row.payload != search_payload:
+                search_row.payload = search_payload
+                search_row.delivered = False
+                search_row.delivered_at = None
+                search_row.lease_owner = None
+                search_row.lease_until = None
+                search_row.next_attempt_at = None
+                search_row.attempts = 0
+                search_row.last_error = None
             inserted += 1
             if inserted % 200 == 0:
                 db.commit()
                 print(f'Imported {inserted}', flush=True)
         db.commit()
-    print(f'Done: {inserted} products; sync Gorse with POST /api/admin/sync')
+    print(f'Done: {inserted} products; sync Gorse /api/admin/sync and search /api/admin/search/sync')
 
 
 def stream(path):

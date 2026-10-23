@@ -4,6 +4,8 @@ COPY services/api/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY services/api/app.py services/api/operational.py /app/
 COPY config /app/config
+COPY alembic.ini /app/alembic.ini
+COPY migrations /app/migrations
 COPY scripts /app/scripts
 ENV APP_CONFIG=/app/config/app.yaml
 ENV PYTHONPATH=/app

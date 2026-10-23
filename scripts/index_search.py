@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Product, SessionLocal  # noqa: E402
+from app import Product, SessionLocal, search_document  # noqa: E402
 
 ALIAS = 'commerce-products'
 MAPPING = {'settings': {'index': {'number_of_shards': 1, 'number_of_replicas': 0}},
@@ -39,7 +39,7 @@ def index_catalog(base: str, batch_size: int = 250):
                 result = db.scalars(select(Product).order_by(Product.id).execution_options(yield_per=batch_size))
                 buffer = []
                 for p in result:
-                    buffer.append({'id': p.id, **{key: getattr(p, key) for key in ('title', 'description', 'brand', 'category', 'price', 'rating', 'source')}})
+                    buffer.append(search_document(p))
                     if len(buffer) >= batch_size:
                         write_bulk(client, base, generation, buffer)
                         count += len(buffer)
@@ -80,9 +80,9 @@ def index_catalog(base: str, batch_size: int = 250):
 def write_bulk(client, base, generation, products):
     lines = []
     for data in products:
-        pid = data.pop('id')
+        pid = data['id']
         lines.append(json.dumps({'index': {'_index': generation, '_id': pid}}))
-        lines.append(json.dumps(data, ensure_ascii=False))
+        lines.append(json.dumps({k: v for k, v in data.items() if k != 'id'}, ensure_ascii=False))
     reply = client.post(f'{base}/_bulk', content='\n'.join(lines) + '\n',
                         headers={'Content-Type': 'application/x-ndjson'})
     reply.raise_for_status()
