@@ -2,7 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY services/api/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-COPY services/api/app.py services/api/operational.py /app/
+COPY services/api/app.py services/api/operational.py services/api/search_coordination.py /app/
 COPY config /app/config
 COPY alembic.ini /app/alembic.ini
 COPY migrations /app/migrations
