@@ -50,7 +50,7 @@ def _build_catalog(base, batch_size, generation, owner):
                 result = db.scalars(select(Product).where(Product.is_active.is_(True)).order_by(Product.id).execution_options(yield_per=batch_size))
                 buffer = []
                 for p in result:
-                    buffer.append(search_document(p))
+                    buffer.append((search_document(p), p.catalog_revision or 1))
                     if len(buffer) >= batch_size:
                         renew_rebuild(SessionLocal, SearchMaintenance, owner)
                         write_bulk(client, base, generation, buffer)
@@ -94,9 +94,11 @@ def _build_catalog(base, batch_size, generation, owner):
 
 def write_bulk(client, base, generation, products):
     lines = []
-    for data in products:
+    for entry in products:
+        data, revision = entry if isinstance(entry, tuple) else (entry, 1)
         pid = data['id']
-        lines.append(json.dumps({'index': {'_index': generation, '_id': pid}}))
+        lines.append(json.dumps({'index': {'_index': generation, '_id': pid,
+                                          'version': revision, 'version_type': 'external_gte'}}))
         lines.append(json.dumps({k: v for k, v in data.items() if k != 'id'}, ensure_ascii=False))
     reply = client.post(f'{base}/_bulk', content='\n'.join(lines) + '\n',
                         headers={'Content-Type': 'application/x-ndjson'})

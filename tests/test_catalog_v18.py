@@ -138,7 +138,7 @@ def test_v17_db_upgrade_to_v18_preserves_data(tmp_path):
         assert result.returncode == 0, result.stderr
     import sqlite3
     with sqlite3.connect(path) as conn:
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()[0] == '0003_v18_catalog_visibility'
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()[0] == '0004_v19_catalog_fencing'
         assert conn.execute("SELECT title, is_active FROM products WHERE id='p:old'").fetchone() == ('Old', 1)
 
 

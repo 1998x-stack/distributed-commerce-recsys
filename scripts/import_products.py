@@ -86,8 +86,9 @@ def import_rows(rows, limit, demo=False):
             existing = db.get(Product, product.id)
             if existing is not None:
                 product.is_active = existing.is_active
-            db.merge(product)
-            queue_catalog_updates(db, product)
+            managed = db.merge(product)
+            db.flush()
+            queue_catalog_updates(db, managed)
             inserted += 1
             if inserted % 200 == 0:
                 db.commit()

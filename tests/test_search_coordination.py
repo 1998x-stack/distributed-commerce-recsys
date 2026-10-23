@@ -156,6 +156,6 @@ def test_v16_schema_upgrades_without_losing_business_rows(tmp_path, monkeypatch)
                                 cwd=ROOT, env=env, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
     with sqlite3.connect(path) as conn:
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()[0] == '0003_v18_catalog_visibility'
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()[0] == '0004_v19_catalog_fencing'
         assert conn.execute("SELECT title FROM products WHERE id='p:legacy'").fetchone()[0] == 'Old row'
         assert conn.execute('SELECT owner FROM search_maintenance WHERE id=1').fetchone() == (None,)

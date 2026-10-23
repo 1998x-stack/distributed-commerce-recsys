@@ -4,6 +4,8 @@ A three-machine LAN e-commerce discovery and recommendation research project. **
 
 > **V1.6 evaluation, database copy and LAN benchmark:** [docs/ITERATION_V1_6.md](docs/ITERATION_V1_6.md). **V1.5 migrations and live catalog updates:** [docs/ITERATION_V1_5.md](docs/ITERATION_V1_5.md). Prior **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
+> **V1.9 catalog revision fencing and anti-entropy:** [docs/ITERATION_V1_9.md](docs/ITERATION_V1_9.md).
+
 > **V1.8 catalog withdrawal and offline model adapters:** [docs/ITERATION_V1_8.md](docs/ITERATION_V1_8.md).
 
 ## Features

@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 import httpx
 import yaml
@@ -96,6 +97,7 @@ class Product(Base):
     rating: Mapped[float] = mapped_column(Float, default=0)
     rating_count: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default='1', index=True)
+    catalog_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default='1')
 
 
 class Event(Base):
@@ -152,6 +154,7 @@ class Outbox(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     kind: Mapped[str] = mapped_column(String(20))
     payload: Mapped[str] = mapped_column(Text)
+    catalog_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default='1')
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     delivered: Mapped[bool] = mapped_column(default=False, index=True)
     # Nullable additions allow non-destructive upgrades of existing V1 databases.
@@ -207,11 +210,15 @@ def upgrade_existing_schema(conn):
     if 'ix_events_visitor_at' not in existing_indexes:
         conn.execute(text('CREATE INDEX ix_events_visitor_at ON events (visitor, at)'))
     columns = {col['name'] for col in inspect(conn).get_columns('products')}
+    if 'catalog_revision' not in columns:
+        conn.execute(text('ALTER TABLE products ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 1'))
     if 'rating_count' not in columns:
         conn.execute(text('ALTER TABLE products ADD COLUMN rating_count INTEGER NOT NULL DEFAULT 0'))
     if 'is_active' not in columns:
         conn.execute(text('ALTER TABLE products ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1'))
     columns = {col['name'] for col in inspect(conn).get_columns('outbox')}
+    if 'catalog_revision' not in columns:
+        conn.execute(text('ALTER TABLE outbox ADD COLUMN catalog_revision INTEGER NOT NULL DEFAULT 1'))
     for name, datatype in required.items():
         if name not in columns:
             conn.execute(text(f'ALTER TABLE outbox ADD COLUMN {name} {datatype}'))
@@ -243,8 +250,8 @@ def check_schema_revision():
             version = conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one()
         except Exception as exc:
             raise RuntimeError('Database not migrated; run `alembic upgrade head` first') from exc
-        if version != '0003_v18_catalog_visibility':
-            raise RuntimeError(f'Expected schema 0003_v18_catalog_visibility, found {version!r}; run Alembic')
+        if version != '0004_v19_catalog_fencing':
+            raise RuntimeError(f'Expected schema 0004_v19_catalog_fencing, found {version!r}; run Alembic')
 
 
 def install_sqlite_fts(conn):
@@ -411,34 +418,74 @@ def admin_key(key: str | None = Header(default=None, alias='X-Admin-Key')):
         raise HTTPException(403, 'Admin authorization required')
 
 
-def queue_catalog_updates(db: Session, product: Product) -> None:
+def gorse_item_document(product: Product) -> dict:
+    return {'ItemId': product.id, 'IsHidden': not product.is_active,
+            'Categories': [product.category],
+            'Labels': {'brand': [product.brand] if product.brand else [],
+                       'category': [product.category]},
+            'Timestamp': '2023-12-31T00:00:00Z' if product.source == 'amazon-2023' else '2026-01-01T00:00:00Z'}
+
+
+def queue_catalog_updates(db: Session, product: Product, *, force: bool = False) -> None:
     """Transactionally persist the latest item + search state.
 
     One deterministic outbox row per product/kind is safe to retry and keeps
     large imports bounded. Remote calls are deliberately outside the transaction.
     """
-    item = {'ItemId': product.id, 'IsHidden': not product.is_active,
-            'Categories': [product.category],
-            'Labels': {'brand': [product.brand] if product.brand else [],
-                       'category': [product.category]},
-            'Timestamp': '2023-12-31T00:00:00Z' if product.source == 'amazon-2023' else '2026-01-01T00:00:00Z'}
+    item = gorse_item_document(product)
     search = search_document(product) if product.is_active else {'id': product.id, '_op': 'delete'}
+    changes = []
     for kind, namespace, payload in (('item', 'gorse-item-', item),
                                       ('search', 'search-item-', search)):
         key = str(uuid.uuid5(uuid.NAMESPACE_URL, namespace + product.id))
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         row = db.get(Outbox, key)
+        changes.append((key, kind, encoded, row))
+    # A transaction-level revision covers both providers. A forced requeue is
+    # used by reconciliation after remote state drift, not by normal imports.
+    changed = force or any(row is None or row.payload != encoded for _, _, encoded, row in changes)
+    if not changed:
+        return
+    if any(row is not None for _, _, _, row in changes):
+        product.catalog_revision = (product.catalog_revision or 1) + 1
+    revision = product.catalog_revision or 1
+    for key, kind, encoded, row in changes:
         if row is None:
-            db.add(Outbox(id=key, kind=kind, payload=encoded))
-        elif row.payload != encoded:
+            db.add(Outbox(id=key, kind=kind, payload=encoded, catalog_revision=revision))
+        else:
             row.payload = encoded
+            row.catalog_revision = revision
             row.delivered = False
             row.delivered_at = None
-            row.lease_owner = None
-            row.lease_until = None
+            # IMPORTANT: never cancel an in-flight lease. That old worker must
+            # complete (or expire) before the new version may be dispatched.
             row.next_attempt_at = None
             row.attempts = 0
             row.last_error = None
+
+
+def acknowledge_catalog_delivery(db: Session, row: Outbox, owner: str, ok: bool,
+                                 error: str, now: datetime) -> tuple[bool, bool]:
+    """ACK only the exact revision sent; release superseded leases for replay."""
+    values = {'lease_owner': None, 'lease_until': None}
+    if ok:
+        values.update(delivered=True, delivered_at=datetime.now(timezone.utc), last_error=None)
+    else:
+        count = (row.attempts or 0) + 1
+        values.update(attempts=count, last_error=error,
+                      next_attempt_at=now + timedelta(seconds=min(1800, 2 ** min(count, 10))))
+    result = db.execute(update(Outbox).where(
+        Outbox.id == row.id, Outbox.lease_owner == owner,
+        Outbox.catalog_revision == row.catalog_revision).values(**values))
+    if result.rowcount:
+        return ok, not ok
+    # The business transaction advanced the revision during the network call.
+    # Do not mark the newer payload delivered or apply backoff to it.
+    db.execute(update(Outbox).where(
+        Outbox.id == row.id, Outbox.lease_owner == owner,
+        Outbox.catalog_revision != row.catalog_revision).values(
+            lease_owner=None, lease_until=None, next_attempt_at=None))
+    return False, False
 
 
 @app.patch('/api/admin/products/{pid}/availability', dependencies=[Depends(admin_key)])
@@ -813,6 +860,10 @@ def metrics(db: Session = Depends(db_session)):
     return {'products': db.scalar(select(func.count()).select_from(Product)),
             'active_products': db.scalar(select(func.count()).select_from(Product).where(Product.is_active.is_(True))),
             'withdrawn_products': db.scalar(select(func.count()).select_from(Product).where(Product.is_active.is_(False))),
+            'catalog_latest_revision': db.scalar(select(func.max(Product.catalog_revision))) or 0,
+            'catalog_leased_tasks': db.scalar(select(func.count()).select_from(Outbox).where(
+                Outbox.kind.in_(['item', 'search']), Outbox.delivered.is_(False),
+                Outbox.lease_owner.is_not(None), Outbox.lease_until > datetime.now(timezone.utc))),
             'search_rebuild_active': bool(gate and gate.owner and gate_remaining > 0),
             'search_rebuild_lease_remaining_seconds': gate_remaining,
             'search_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind == 'search', Outbox.delivered.is_(False))),
@@ -822,6 +873,77 @@ def metrics(db: Session = Depends(db_session)):
             'oldest_pending_seconds': age_seconds,
             'database': DRIVER, 'circuits': app.state.circuits.status(),
             'requests': app.state.runtime_metrics.snapshot()}
+
+
+@app.post('/api/admin/catalog/reconcile', dependencies=[Depends(admin_key)])
+def reconcile_catalog(request: Request, after: str = Query('', max_length=128),
+                      limit: int = Query(10, ge=1, le=25), repair: bool = False,
+                      db: Session = Depends(db_session)):
+    """Bounded remote read-back: detect and optionally requeue inconsistent items.
+
+    Gorse does not expose conditional versions, so this is anti-entropy repair,
+    not a substitute for real remote CAS. Remote outages never trigger repairs.
+    """
+    gorse_url = CONFIG['services']['gorse'].rstrip('/')
+    search_url = CONFIG['services']['search'].rstrip('/')
+    if not gorse_url and not search_url:
+        raise HTTPException(503, 'Configure at least one catalog provider')
+    products = db.scalars(select(Product).where(Product.id > after)
+                          .order_by(Product.id).limit(limit)).all()
+    headers = {'X-API-Key': os.environ['GORSE_API_KEY']} if os.getenv('GORSE_API_KEY') else {}
+    drift = []
+    errors = []
+    fixed = 0
+    for p in products:
+        inconsistent = []
+        encoded_id = quote(p.id, safe='')
+        if gorse_url:
+            try:
+                result = request.app.state.provider_http.get(
+                    f'{gorse_url}/api/item/{encoded_id}', headers=headers, timeout=3)
+                if result.status_code == 404:
+                    if p.is_active:
+                        inconsistent.append('gorse')
+                else:
+                    result.raise_for_status()
+                    remote = result.json()
+                    expected = gorse_item_document(p)
+                    if not isinstance(remote, dict) or any(remote.get(k) != expected[k] for k in
+                            ('ItemId', 'IsHidden', 'Categories', 'Labels')):
+                        inconsistent.append('gorse')
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                errors.append({'product_id': p.id, 'provider': 'gorse', 'type': type(exc).__name__})
+        if search_url:
+            try:
+                result = request.app.state.provider_http.get(
+                    f'{search_url}/commerce-products/_doc/{encoded_id}', timeout=3)
+                if result.status_code == 404:
+                    if p.is_active:
+                        inconsistent.append('search')
+                else:
+                    result.raise_for_status()
+                    remote = result.json()
+                    expected = search_document(p)
+                    document = remote.get('_source', {}) if isinstance(remote, dict) else {}
+                    # OpenSearch _source excludes the ID; it is encoded as _id.
+                    if ((not p.is_active) or (not remote.get('found', True)) or
+                        remote.get('_id') != p.id or not isinstance(document, dict) or
+                        any(document.get(k) != v for k, v in expected.items() if k != 'id')):
+                        inconsistent.append('search')
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                errors.append({'product_id': p.id, 'provider': 'search', 'type': type(exc).__name__})
+        if inconsistent:
+            for provider in inconsistent:
+                request.app.state.runtime_metrics.increment('catalog_drift_' + provider)
+            drift.append({'product_id': p.id, 'providers': inconsistent})
+            if repair:
+                queue_catalog_updates(db, p, force=True)
+                fixed += 1
+                request.app.state.runtime_metrics.increment('catalog_repaired')
+    if fixed:
+        db.commit()
+    return {'checked': len(products), 'drift': drift, 'errors': errors,
+            'requeued': fixed, 'next_after': products[-1].id if products else None}
 
 
 @app.post('/api/admin/sync', dependencies=[Depends(admin_key)])
@@ -841,6 +963,8 @@ def sync(request: Request, batch: int = Query(200, ge=1, le=1000), db: Session =
         .returning(Outbox.id)).scalars().all()
     db.commit()
     rows = db.scalars(select(Outbox).where(Outbox.id.in_(claimed))).all() if claimed else []
+    # Freeze exactly the version and payload sent, independently of later updates.
+    rows = [Outbox(id=r.id, kind=r.kind, payload=r.payload, catalog_revision=r.catalog_revision, attempts=r.attempts) for r in rows]
     sent = 0
     failures = 0
     headers = {'X-API-Key': os.environ['GORSE_API_KEY']} if os.getenv('GORSE_API_KEY') else {}
@@ -869,17 +993,24 @@ def sync(request: Request, batch: int = Query(200, ge=1, le=1000), db: Session =
         results.extend((row.id, False, 'Unsupported outbox kind') for row in other_rows)
     by_id = {row.id: row for row in rows}
     for row_id, ok, error in results:
+        if by_id[row_id].kind == 'item':
+            delivered, failed = acknowledge_catalog_delivery(db, by_id[row_id], owner, ok, error, now)
+            sent += int(delivered)
+            failures += int(failed)
+            continue
+        row = by_id[row_id]
         values = {'lease_owner': None, 'lease_until': None}
         if ok:
             values.update(delivered=True, delivered_at=datetime.now(timezone.utc), last_error=None)
-            sent += 1
         else:
-            count = (by_id[row_id].attempts or 0) + 1
+            count = (row.attempts or 0) + 1
             values.update(attempts=count, last_error=error,
                           next_attempt_at=now + timedelta(seconds=min(1800, 2 ** min(count, 10))))
-            failures += 1
-        # Only the current owner may ACK. This protects an item that was reimported mid-flight.
-        db.execute(update(Outbox).where(Outbox.id == row_id, Outbox.lease_owner == owner).values(**values))
+        ack = db.execute(update(Outbox).where(Outbox.id == row_id,
+                             Outbox.lease_owner == owner).values(**values))
+        if ack.rowcount:
+            sent += int(ok)
+            failures += int(not ok)
     db.commit()
     remaining = db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False), Outbox.kind.in_(['item', 'feedback'])))
     return {'claimed': len(claimed), 'delivered': sent, 'failed': failures, 'remaining': remaining}
@@ -924,20 +1055,22 @@ def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
                         .returning(Outbox.id)).scalars().all()
     db.commit()
     rows = db.scalars(select(Outbox).where(Outbox.id.in_(claimed)).order_by(Outbox.created_at, Outbox.id)).all() if claimed else []
+    rows = [Outbox(id=r.id, kind=r.kind, payload=r.payload, catalog_revision=r.catalog_revision, attempts=r.attempts) for r in rows]
     results: list[tuple[str, bool, str]] = []
     for start in range(0, len(rows), 100):
         chunk = rows[start:start + 100]
         try:
             docs = [json.loads(row.payload) for row in chunk]
             ndjson = []
-            for doc in docs:
+            for row, doc in zip(chunk, docs):
                 identifier = doc.get('id')
                 if not identifier:
                     raise ValueError('Missing search document id')
                 operation = doc.get('_op', 'index')
                 if operation not in ('index', 'delete'):
                     raise ValueError('Unsupported search outbox operation')
-                ndjson.append(json.dumps({operation: {'_index': 'commerce-products', '_id': identifier}}))
+                ndjson.append(json.dumps({operation: {'_index': 'commerce-products', '_id': identifier,
+                                      'version': row.catalog_revision, 'version_type': 'external_gte'}}))
                 if operation == 'index':
                     ndjson.append(json.dumps({k: v for k, v in doc.items() if k not in ('id', '_op')}, ensure_ascii=False))
             resp = request.app.state.provider_http.post(
@@ -963,18 +1096,9 @@ def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
     by_id = {row.id: row for row in rows}
     sent = failed = 0
     for row_id, ok, error in results:
-        values = {'lease_owner': None, 'lease_until': None}
-        if ok:
-            values.update(delivered=True, delivered_at=datetime.now(timezone.utc), last_error=None)
-        else:
-            attempts = (by_id[row_id].attempts or 0) + 1
-            values.update(attempts=attempts, last_error=error,
-                          next_attempt_at=now + timedelta(seconds=min(1800, 2 ** min(attempts, 10))))
-        ack = db.execute(update(Outbox).where(Outbox.id == row_id, Outbox.lease_owner == owner)
-                         .values(**values))
-        if ack.rowcount:
-            sent += int(ok)
-            failed += int(not ok)
+        delivered, did_fail = acknowledge_catalog_delivery(db, by_id[row_id], owner, ok, error, now)
+        sent += int(delivered)
+        failed += int(did_fail)
     db.commit()
     remaining = db.scalar(select(func.count()).select_from(Outbox).where(
         Outbox.kind == 'search', Outbox.delivered.is_(False)))

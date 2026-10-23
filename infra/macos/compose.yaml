@@ -101,6 +101,26 @@ services:
     cap_drop: [ALL]
     logging:
       options: {max-size: "10m", max-file: "3"}
+  reconciler:
+    profiles: ["reconciliation"]
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api: {condition: service_healthy}
+    environment:
+      API_URL: http://api:8000
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
+    # Opt-in maintenance: bound every pass, never exposed on a public port.
+    command: ["sh", "-c", "while true; do python /app/scripts/reconcile_catalog.py --repair --limit 25 --max-pages 100 || true; sleep 3600; done"]
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging:
+      options: {max-size: "10m", max-file: "3"}
   storefront:
     build:
       context: ../..
