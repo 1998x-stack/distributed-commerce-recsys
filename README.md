@@ -2,6 +2,8 @@
 
 A three-machine LAN e-commerce discovery and recommendation research project. **SQLite is the default business database**; PostgreSQL can be selected by configuration. Gorse maintains a *separate* PostgreSQL data store, because Gorse does not support SQLite as its data store.
 
+> **V1.2 optimization audit:** [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md) — completed fixes, open production risks and verification commands.
+
 ## Features
 
 - Next.js storefront with product browsing, search, category filters, details and demo cart.
@@ -53,7 +55,7 @@ Without Gorse / OpenSearch, the API intentionally uses SQL search and interest +
 2. Clone the repository onto *each* machine. Run `cp .env.example .env`; replace all IP addresses and placeholder secrets. Keep `.env` out of Git. Generate secrets using `openssl rand -hex 32`.
 3. On **Ubuntu A**: `docker compose --env-file .env -f infra/ubuntu-a/compose.yaml up -d`
 4. On **Ubuntu B**: `docker compose --env-file .env -f infra/ubuntu-b/compose.yaml up -d`
-5. On **macOS**: `docker compose --env-file .env -f infra/macos/compose.yaml up -d --build`
+5. Set `ALLOWED_ORIGINS` to the storefront origin (e.g. `http://192.168.1.103:3000`) and update all secrets. On **macOS**: `docker compose --env-file .env -f infra/macos/compose.yaml up -d --build`
 6. On Mac import demo products into the **Docker volume**, not the host SQLite file:
 
 ```bash
@@ -69,7 +71,7 @@ docker compose --env-file .env -f infra/macos/compose.yaml exec api python /app/
 curl -X POST -H "X-Admin-Key: $ADMIN_KEY" 'http://127.0.0.1:8000/api/admin/sync?batch=1000'
 ```
 
-Use a repeated sync job (e.g. `scripts/sync_gorse.py`) for ongoing updates. Gorse offline models refresh periodically, so local fallback and newest-session reranking are separate from learned Gorse results.
+The Mac Compose file now runs a `sync` sidecar that invokes `scripts/sync_gorse.py` every 30 seconds. Use `docker compose -f infra/macos/compose.yaml logs -f sync` to inspect failures. Gorse offline models refresh periodically, so local fallback and newest-session reranking are separate from learned Gorse results.
 
 ### Database switching
 
@@ -83,15 +85,7 @@ DB_DRIVER=postgresql
 DATABASE_URL_POSTGRES=postgresql://commerce:strong-secret@UBUNTU_A_IP:5432/commerce
 ```
 
-PostgreSQL in Ubuntu A's default Compose is **Gorse-only**. Optional business PostgreSQL is a separate Compose-profile service with its own role, database and private-LAN port:
-
-```bash
-# On Ubuntu A after setting COMMERCE_PG_PASSWORD and DATABASE_URL_POSTGRES
-# Choose the profile to launch the additional business PostgreSQL instance
-docker compose --env-file .env -f infra/ubuntu-a/compose.yaml --profile business-postgres up -d
-```
-
-Then set `DB_DRIVER=postgresql` on Mac and recreate the API container. Use matching passwords and private subnet firewall; there is no automatic SQLite-to-PostgreSQL data migration. Never reuse Gorse's PostgreSQL database for commerce business tables.
+PostgreSQL in Ubuntu A's Compose is initially **Gorse-only**, not a pre-created commerce database. For PostgreSQL business mode provision a **separate role/database** and publish access on the private LAN with authentication and firewall rules; do not reuse Gorse's credentials/database.
 
 ### Security
 
@@ -107,10 +101,6 @@ curl http://127.0.0.1:8000/api/products
 curl 'http://127.0.0.1:8000/api/search?q=headphones'
 ```
 
-## Algorithms and evaluation
-
-Optional RecBole and deterministic item-co-visitation/offline evaluation are in `ml/`. See `ml/README.md`. The default UI is styled with Tailwind and custom CSS.
-
 ## Data sources
 
 - Amazon Reviews 2023 metadata: https://amazon-reviews-2023.github.io/main.html (download category `meta_*.jsonl.gz`; read rights before redistribution).
@@ -121,3 +111,11 @@ Optional RecBole and deterministic item-co-visitation/offline evaluation are in 
 ## Limitations
 
 V1 is a runnable research baseline, not full Taobao/JD functionality: single-node search storage, no distributed SQL, no payment system, no account login, no high-availability guarantees. `create_all` covers first-run schema creation; use Alembic migrations before persistent production use. Gorse eventual consistency and cold-start fallbacks should be evaluated separately. See `docs/ARCHITECTURE.md`.
+
+### Search index rebuild in V1.2
+
+`scripts/index_search.py` streams products in batches into a new versioned OpenSearch index and atomically promotes the `commerce-products` alias after the index is complete. The first upgrade replaces the old V1 index named `commerce-products`; subsequent rebuilds retain prior generation indexes (prune only after confirming the new one works). **Category filters require this rebuild** because `category` is now indexed as a `keyword` field.
+
+### Testing limitations
+
+Local tests verify SQLite/API workflows and mocked Gorse failure handling, but no Docker integration was run in the code-review environment. The project is still a LAN research prototype; consult the audit ledger before attempting production use.

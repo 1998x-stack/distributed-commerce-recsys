@@ -1,11 +1,15 @@
 """Commerce API: SQLite-first, PostgreSQL-ready, with search/recs degradation."""
 from __future__ import annotations
+import asyncio
+import hashlib
+import hmac
 import json
+import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -13,9 +17,13 @@ import httpx
 import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event as sqla_event, func, or_, select
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index, create_engine, event as sqla_event, func, inspect, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import JSONResponse
+
+logger = logging.getLogger("commerce.api")
 
 
 def settings() -> dict:
@@ -80,6 +88,7 @@ class Product(Base):
 
 class Event(Base):
     __tablename__ = 'events'
+    __table_args__ = (Index('ix_events_visitor_at', 'visitor', 'at'),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     visitor: Mapped[str] = mapped_column(String(36), index=True)
     product_id: Mapped[str] = mapped_column(ForeignKey('products.id'), index=True)
@@ -106,10 +115,15 @@ class Outbox(Base):
     payload: Mapped[str] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     delivered: Mapped[bool] = mapped_column(default=False, index=True)
+    # Nullable additions allow non-destructive upgrades of existing V1 databases.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(36))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(512))
 
 
 class EventInput(BaseModel):
-    product_id: str
+    product_id: str = Field(min_length=1, max_length=128)
     event_type: Literal['impression', 'click', 'favorite', 'cart', 'purchase_demo']
     request_id: str = Field(default='', max_length=64)
     position: int = Field(default=-1, ge=-1, le=100000)
@@ -117,18 +131,57 @@ class EventInput(BaseModel):
 
 
 class CartInput(BaseModel):
-    product_id: str
+    product_id: str = Field(min_length=1, max_length=128)
     quantity: int = Field(default=1, ge=1, le=20)
+
+
+def initialize_schema():
+    """Backward-compatible V1 additive upgrade. Use Alembic for future changes."""
+    Base.metadata.create_all(engine)
+    required = {
+        'next_attempt_at': 'TIMESTAMP',
+        'lease_owner': 'VARCHAR(36)',
+        'lease_until': 'TIMESTAMP',
+        'last_error': 'VARCHAR(512)',
+    }
+    with engine.begin() as conn:
+        # Existing V1 databases created before the composite index need it too.
+        existing_indexes = {idx['name'] for idx in inspect(conn).get_indexes('events')}
+        if 'ix_events_visitor_at' not in existing_indexes:
+            conn.execute(text('CREATE INDEX ix_events_visitor_at ON events (visitor, at)'))
+        columns = {col['name'] for col in inspect(conn).get_columns('outbox')}
+        for name, datatype in required.items():
+            if name not in columns:
+                conn.execute(text(f'ALTER TABLE outbox ADD COLUMN {name} {datatype}'))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(engine)
+    initialize_schema()
     yield
 
 
-app = FastAPI(title='Distributed Commerce RecSys API', version='0.1.1', lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=os.getenv('SESSION_SECRET', 'development-only-change-me'), same_site='lax', https_only=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
+SECRET = os.getenv('SESSION_SECRET')
+if not SECRET or SECRET.startswith(('replace-', 'development-only')):
+    if os.getenv('APP_ENV', 'development') == 'production':
+        raise RuntimeError('Configure a strong SESSION_SECRET in production')
+    SECRET = secrets.token_urlsafe(48)
+    logger.warning('SESSION_SECRET absent: random ephemeral development secret; sessions reset on restart')
+
+app = FastAPI(title='Distributed Commerce RecSys API', version='0.2.0', lifespan=lifespan)
+app.add_middleware(SessionMiddleware, secret_key=SECRET, same_site='lax', https_only=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
+
+
+@app.middleware('http')
+async def origin_guard(request: Request, call_next):
+    """Reject unexpected browser-originated writes; non-browser API clients have admin auth."""
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        origin = request.headers.get('origin')
+        if origin:
+            allowed = {url.strip().rstrip('/') for url in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') if url.strip()}
+            if origin.rstrip('/') not in allowed:
+                return JSONResponse({'detail': 'Origin not allowed'}, status_code=403)
+    return await call_next(request)
 
 
 def db_session():
@@ -166,7 +219,11 @@ def live():
 
 @app.get('/health/ready')
 def ready(db: Session = Depends(db_session)):
-    db.execute(select(func.count()).select_from(Product)).scalar_one()
+    try:
+        db.execute(select(func.count()).select_from(Product)).scalar_one()
+    except Exception:
+        logger.exception('Readiness failed')
+        raise HTTPException(503, 'Database unavailable')
     return {'status': 'ready', 'database': DRIVER}
 
 
@@ -203,42 +260,63 @@ async def search(q: str = Query(..., min_length=1, max_length=160), category: st
     base_url = CONFIG['services']['search'].rstrip('/')
     if base_url:
         try:
-            query = {'size': limit, 'query': {'bool': {'must': [{'multi_match': {'query': q, 'fields': ['title^4', 'brand^2', 'description', 'category^2']}}], 'filter': ([{'term': {'category.keyword': category}}] if category else [])}}}
+            query = {'size': limit, 'query': {'bool': {'must': [{'multi_match': {'query': q, 'fields': ['title^4', 'brand^2', 'description', 'category^2']}}], 'filter': ([{'term': {'category': category}}] if category else [])}}}
             async with httpx.AsyncClient(timeout=2.0) as client:
                 resp = await client.post(base_url + '/commerce-products/_search', json=query)
                 resp.raise_for_status()
                 ids = [hit['_id'] for hit in resp.json().get('hits', {}).get('hits', [])]
                 provider = 'opensearch'
-        except (httpx.HTTPError, ValueError, KeyError):
-            pass
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            logger.warning('Search provider unavailable, using SQL: %s', type(exc).__name__)
     if provider == 'opensearch':
         mapped = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids))).all()}
         items = [as_product(mapped[i]) for i in ids if i in mapped]
     else:
-        like = f'%{q}%'
-        stmt = select(Product).where(or_(Product.title.ilike(like), Product.description.ilike(like), Product.brand.ilike(like)))
+        escaped = q.replace('\\', '\\\\').replace('%', r'\%').replace('_', r'\_')
+        like = f'%{escaped}%'
+        stmt = select(Product).where(or_(Product.title.ilike(like, escape='\\'), Product.description.ilike(like, escape='\\'), Product.brand.ilike(like, escape='\\')))
         if category:
             stmt = stmt.where(Product.category == category)
-        items = [as_product(p) for p in db.scalars(stmt.limit(limit)).all()]
+        items = [as_product(p) for p in db.scalars(stmt.order_by(Product.rating.desc(), Product.id).limit(limit)).all()]
     return {'items': items, 'provider': provider, 'query': q}
 
 
 WEIGHTS = {'impression': 0, 'click': 1, 'favorite': 3, 'cart': 5, 'purchase_demo': 8}
 
 
+def scoped_idempotency(visitor_id: str, key: str) -> str:
+    """Prevents two visitors using the same client key from conflicting."""
+    return hmac.new(SECRET.encode(), f'{visitor_id}:{key}'.encode(), hashlib.sha256).hexdigest()
+
+
+def check_duplicate(db: Session, who: str, key: str, payload: EventInput):
+    found = db.scalar(select(Event).where(Event.idempotency_key == key))
+    if not found:
+        return False
+    if found.visitor != who or found.product_id != payload.product_id or found.event_type != payload.event_type or found.request_id != payload.request_id or found.position != payload.position:
+        raise HTTPException(409, 'Idempotency key reused with different event payload')
+    return True
+
+
 @app.post('/api/events', status_code=201)
 def record_event(payload: EventInput, request: Request, db: Session = Depends(db_session)):
     ensure_product(db, payload.product_id)
     who = visitor(request)
-    if payload.idempotency_key and db.scalar(select(Event.id).where(Event.idempotency_key == payload.idempotency_key)):
+    key = scoped_idempotency(who, payload.idempotency_key) if payload.idempotency_key else None
+    if key and check_duplicate(db, who, key, payload):
         return {'duplicate': True}
-    ev = Event(id=str(uuid.uuid4()), visitor=who, product_id=payload.product_id, event_type=payload.event_type, request_id=payload.request_id, position=payload.position, idempotency_key=payload.idempotency_key)
+    ev = Event(id=str(uuid.uuid4()), visitor=who, product_id=payload.product_id, event_type=payload.event_type, request_id=payload.request_id, position=payload.position, idempotency_key=key)
     db.add(ev)
     if WEIGHTS[payload.event_type]:
-        # Outbox is atomic with event record; worker retries if Gorse is unavailable.
         feedback = {'FeedbackType': payload.event_type, 'UserId': who, 'ItemId': payload.product_id, 'Value': float(WEIGHTS[payload.event_type]), 'Timestamp': datetime.now(timezone.utc).isoformat()}
         db.add(Outbox(id=str(uuid.uuid4()), kind='feedback', payload=json.dumps(feedback)))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if key and check_duplicate(db, who, key, payload):
+            return {'duplicate': True}
+        raise
     return {'id': ev.id, 'recorded': True}
 
 
@@ -283,44 +361,70 @@ async def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: S
     base = CONFIG['services']['gorse'].rstrip('/')
     if base:
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(f'{base}/api/recommend/{who}', params={'n': limit})
+            headers = {'X-API-Key': os.environ['GORSE_API_KEY']} if os.getenv('GORSE_API_KEY') else {}
+            async with httpx.AsyncClient(timeout=2.0, headers=headers) as client:
+                resp = await client.get(f'{base}/api/recommend/{who}', params={'n': limit * 2})
                 resp.raise_for_status()
                 ids = [r if isinstance(r, str) else r['Id'] for r in resp.json()]
-            if ids:
-                strategy = 'gorse'
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            pass
-    # Fallback: own positive events influence preference for categories.
-    history = db.execute(select(Event.product_id, Event.event_type).where(Event.visitor == who).order_by(Event.at.desc()).limit(120)).all()
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            logger.warning('Gorse unavailable, using fallback: %s', type(exc).__name__)
+
+    history = db.execute(select(Event.product_id, Event.event_type).where(Event.visitor == who).order_by(Event.at.desc(), Event.id.desc()).limit(120)).all()
     seen = {pid for pid, _ in history}
     category_scores: dict[str, float] = {}
-    if history:
-        pmap = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(seen))).all()}
+    if seen:
+        category_map = dict(db.execute(select(Product.id, Product.category).where(Product.id.in_(seen))).all())
         for pid, etype in history:
-            if pid in pmap:
-                category = pmap[pid].category
-                category_scores[category] = category_scores.get(category, 0) + WEIGHTS.get(etype, 0)
-    all_products = db.scalars(select(Product).order_by(Product.id).limit(5000)).all()
-    popularity = dict(db.execute(select(Event.product_id, func.count()).group_by(Event.product_id)).all())
-    ranked = sorted(all_products, key=lambda p: (category_scores.get(p.category, 0) * 10 + popularity.get(p.id, 0), p.rating, p.id), reverse=True)
-    ordered = []
-    for pid in ids:
-        p = next((x for x in all_products if x.id == pid), None)
-        if p and p.id not in seen and p not in ordered:
-            ordered.append(p)
-    for p in ranked:
-        if p.id not in seen and p not in ordered:
-            ordered.append(p)
+            if pid in category_map:
+                cat = category_map[pid]
+                category_scores[cat] = category_scores.get(cat, 0) + WEIGHTS.get(etype, 0)
+
+    ordered: list[Product] = []
+    added: set[str] = set(seen)
+
+    def add_candidates(candidates):
+        for product in candidates:
+            if product.id not in added and len(ordered) < limit:
+                ordered.append(product)
+                added.add(product.id)
+
+    if ids:
+        gorse_rows = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids))).all()}
+        add_candidates(gorse_rows[pid] for pid in ids if pid in gorse_rows)
+        if ordered:
+            strategy = 'gorse+fallback'
+
+    # Bounded DB queries: never deserialize the whole catalog to rank in Python.
+    for cat, _score in sorted(category_scores.items(), key=lambda item: -item[1])[:3]:
         if len(ordered) >= limit:
             break
-    return {'items': [as_product(p) for p in ordered[:limit]], 'strategy': strategy, 'visitor': who}
+        stmt = select(Product).where(Product.category == cat)
+        if added:
+            stmt = stmt.where(Product.id.not_in(added))
+        add_candidates(db.scalars(stmt.order_by(Product.rating.desc(), Product.id).limit(limit)).all())
+
+    if len(ordered) < limit:
+        popularity = (select(Event.product_id.label('pid'), func.count(Event.id).label('score'))
+                      .where(Event.event_type.in_(['click', 'favorite', 'cart', 'purchase_demo']))
+                      .group_by(Event.product_id).order_by(func.count(Event.id).desc()).limit(limit * 3)).subquery()
+        stmt = select(Product).join(popularity, Product.id == popularity.c.pid).order_by(popularity.c.score.desc(), Product.id)
+        if added:
+            stmt = stmt.where(Product.id.not_in(added))
+        add_candidates(db.scalars(stmt.limit(limit)).all())
+    if len(ordered) < limit:
+        stmt = select(Product).order_by(Product.rating.desc(), Product.id)
+        if added:
+            stmt = stmt.where(Product.id.not_in(added))
+        add_candidates(db.scalars(stmt.limit(limit)).all())
+    if strategy == 'gorse+fallback' and len(ordered) == min(limit, len(ids)):
+        strategy = 'gorse'
+    return {'items': [as_product(p) for p in ordered], 'strategy': strategy}
 
 
 @app.get('/api/recommendations/similar/{pid}')
 def similar(pid: str, limit: int = Query(8, ge=1, le=30), db: Session = Depends(db_session)):
     p = ensure_product(db, pid)
-    matches = db.scalars(select(Product).where(Product.category == p.category, Product.id != p.id).limit(limit)).all()
+    matches = db.scalars(select(Product).where(Product.category == p.category, Product.id != p.id).order_by(Product.rating.desc(), Product.id).limit(limit)).all()
     return {'items': [as_product(x) for x in matches], 'strategy': 'category'}
 
 
@@ -330,23 +434,55 @@ def metrics(db: Session = Depends(db_session)):
 
 
 @app.post('/api/admin/sync', dependencies=[Depends(admin_key)])
-async def sync(batch: int = Query(100, ge=1, le=1000), db: Session = Depends(db_session)):
+async def sync(batch: int = Query(100, ge=1, le=100), db: Session = Depends(db_session)):
     url = CONFIG['services']['gorse'].rstrip('/')
     if not url:
         raise HTTPException(503, 'GORSE_URL not configured')
-    rows = db.scalars(select(Outbox).where(Outbox.delivered == False).order_by(Outbox.id).limit(batch)).all()
-    sent = 0
-    async with httpx.AsyncClient(timeout=10) as client:
-        for row in rows:
-            try:
-                if row.kind == 'feedback':
-                    response = await client.put(url + '/api/feedback', json=[json.loads(row.payload)])
-                else:
-                    response = await client.post(url + '/api/items', json=[json.loads(row.payload)])
-                response.raise_for_status()
-                row.delivered = True
-                sent += 1
-            except (httpx.HTTPError, ValueError):
-                row.attempts += 1
+    now = datetime.now(timezone.utc)
+    owner = str(uuid.uuid4())
+    available = ((Outbox.lease_until.is_(None)) | (Outbox.lease_until < now))
+    due = ((Outbox.next_attempt_at.is_(None)) | (Outbox.next_attempt_at <= now))
+    pending = select(Outbox.id).where(Outbox.delivered.is_(False), available, due).order_by(Outbox.id).limit(batch)
+    # Atomic compare-and-swap lease works with SQLite >=3.35 and PostgreSQL.
+    claimed = db.execute(update(Outbox)
+        .where(Outbox.id.in_(pending), Outbox.delivered.is_(False), available, due)
+        .values(lease_owner=owner, lease_until=now + timedelta(minutes=5))
+        .returning(Outbox.id)).scalars().all()
     db.commit()
-    return {'delivered': sent, 'remaining': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered == False))}
+    rows = db.scalars(select(Outbox).where(Outbox.id.in_(claimed))).all() if claimed else []
+    sent = 0
+    failures = 0
+    headers = {'X-API-Key': os.environ['GORSE_API_KEY']} if os.getenv('GORSE_API_KEY') else {}
+    semaphore = asyncio.Semaphore(8)
+    async with httpx.AsyncClient(timeout=5.0, headers=headers) as client:
+        async def send(row):
+            async with semaphore:
+                try:
+                    payload = json.loads(row.payload)
+                    if row.kind == 'feedback':
+                        response = await client.put(url + '/api/feedback', json=[payload])
+                    elif row.kind == 'item':
+                        response = await client.post(url + '/api/items', json=[payload])
+                    else:
+                        raise ValueError('Unsupported outbox kind')
+                    response.raise_for_status()
+                    return (row.id, True, '')
+                except (httpx.HTTPError, ValueError) as exc:
+                    return (row.id, False, str(exc)[:512])
+        results = await asyncio.gather(*(send(row) for row in rows))
+    for row_id, ok, error in results:
+        values = {'lease_owner': None, 'lease_until': None}
+        if ok:
+            values.update(delivered=True, last_error=None)
+            sent += 1
+        else:
+            old = next(row for row in rows if row.id == row_id)
+            count = (old.attempts or 0) + 1
+            values.update(attempts=count, last_error=error,
+                          next_attempt_at=now + timedelta(seconds=min(1800, 2 ** min(count, 10))))
+            failures += 1
+        # Never ACK a row whose payload was changed/requeued during the request.
+        db.execute(update(Outbox).where(Outbox.id == row_id, Outbox.lease_owner == owner).values(**values))
+    db.commit()
+    remaining = db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False)))
+    return {'claimed': len(claimed), 'delivered': sent, 'failed': failures, 'remaining': remaining}

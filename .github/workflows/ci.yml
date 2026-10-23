@@ -12,3 +12,15 @@ jobs:
           python-version: '3.12'
       - run: pip install -r services/api/requirements.txt pytest
       - run: PYTHONPATH=services/api pytest -q tests
+      - run: python -m compileall -q services/api scripts ml
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+        working-directory: apps/storefront
+      - run: npm run build
+        working-directory: apps/storefront

@@ -5,6 +5,7 @@ Usage: PYTHONPATH=services/api python scripts/import_products.py --demo
 """
 import argparse
 import gzip
+import math
 import json
 import re
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Base, Product, Outbox, SessionLocal, engine  # noqa: E402
+from app import Product, Outbox, SessionLocal, initialize_schema  # noqa: E402
 
 DEMO = [
  ('Wireless Studio Headphones', 'Audio', 'Novus', 79.95), ('Compact Bluetooth Earbuds', 'Audio', 'Sonora', 49.90),
@@ -33,11 +34,12 @@ DEMO = [
 
 def parse_price(value):
     if isinstance(value, (int, float)):
-        return float(max(0, value))
+        return float(max(0, value)) if math.isfinite(float(value)) else 0.0
     if not isinstance(value, str):
         return 0.0
     m = re.search(r'\d+(?:,\d{3})*(?:\.\d+)?', value)
-    return float(m.group().replace(',', '')) if m else 0.0
+    result = float(m.group().replace(',', '')) if m else 0.0
+    return result if math.isfinite(result) else 0.0
 
 
 def normalize(raw, index, demo=False):
@@ -66,7 +68,7 @@ def normalize(raw, index, demo=False):
 
 
 def import_rows(rows, limit, demo=False):
-    Base.metadata.create_all(engine)
+    initialize_schema()
     inserted = 0
     with SessionLocal() as db:
         for i, raw in enumerate(rows):
@@ -79,8 +81,20 @@ def import_rows(rows, limit, demo=False):
             payload = {'ItemId': product.id, 'IsHidden': False, 'Categories': [product.category],
                        'Labels': {'brand': [product.brand] if product.brand else [], 'category': [product.category]}}
             outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'gorse-item-' + product.id))
-            if not db.get(Outbox, outbox_id):
-                db.add(Outbox(id=outbox_id, kind='item', payload=json.dumps(payload)))
+            new_payload = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+            record = db.get(Outbox, outbox_id)
+            if record is None:
+                db.add(Outbox(id=outbox_id, kind='item', payload=new_payload))
+            elif record.payload != new_payload:
+                # Requeue changed metadata even when the old version was already sent.
+                # Cancel any in-flight lease: a stale delivery must never ACK the new payload.
+                record.payload = new_payload
+                record.delivered = False
+                record.lease_owner = None
+                record.lease_until = None
+                record.next_attempt_at = None
+                record.attempts = 0
+                record.last_error = None
             inserted += 1
             if inserted % 200 == 0:
                 db.commit()

@@ -21,17 +21,18 @@ export default function Home() {
   const [provider, setProvider] = useState('local');
   const [strategy, setStrategy] = useState('local');
   const [error, setError] = useState('');
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (signal?:AbortSignal) => {
     try {
-      const data: Result = query ? await fetchJSON(`/api/search?q=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`)
-        : await fetchJSON(`/api/products?limit=60&category=${encodeURIComponent(category)}`);
+      const data: Result = query ? await fetchJSON(`/api/search?q=${encodeURIComponent(query)}&category=${encodeURIComponent(category)}`, {signal})
+        : await fetchJSON(`/api/products?limit=60&category=${encodeURIComponent(category)}`, {signal});
+      if(signal?.aborted) return;
       setItems(data.items); setProvider(data.provider || 'database'); setError('');
-    } catch {setError('API 尚未连接。请启动 Mac 上的 FastAPI。');}
+    } catch {if(!signal?.aborted) setError('API 尚未连接。请启动 Mac 上的 FastAPI。');}
   }, [query,category]);
   const refreshRecommendations = useCallback(async () => {
     try {const result:Result = await fetchJSON('/api/recommendations/home?limit=8');setSuggested(result.items);setStrategy(result.strategy || 'local');} catch { /* optional */ }
   }, []);
-  useEffect(() => {reload();}, [reload]);
+  useEffect(() => {const controller = new AbortController(); reload(controller.signal); return () => controller.abort();}, [reload]);
   useEffect(() => {refreshRecommendations();fetchJSON('/api/categories').then(setCategories).catch(()=>{});fetchJSON('/api/cart').then(r=>setCart(r.items.reduce((n:number, i:{quantity:number})=>n+i.quantity,0))).catch(()=>{});}, [refreshRecommendations]);
   const emit = async (product:Product, event_type:'click'|'favorite'|'cart') => {
     try {await fetchJSON('/api/events', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product_id:product.id,event_type})});} catch { /* do not block browsing */ }
