@@ -15,8 +15,8 @@ auto_insert_item = true
 cache_size = 100
 
 [recommend.data_source]
-positive_feedback_types = ["click", "favorite", "cart", "purchase_demo"]
-read_feedback_types = ["click"]
+positive_feedback_types = ["click", "favorite", "cart", "purchase_demo", "review"]
+read_feedback_types = ["impression"]
 
 # Built-in latest recommender is used for cold start.
 

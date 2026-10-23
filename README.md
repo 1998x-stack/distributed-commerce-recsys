@@ -2,14 +2,14 @@
 
 A three-machine LAN e-commerce discovery and recommendation research project. **SQLite is the default business database**; PostgreSQL can be selected by configuration. Gorse maintains a *separate* PostgreSQL data store, because Gorse does not support SQLite as its data store.
 
-> **V1.2 optimization audit:** [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md) — completed fixes, open production risks and verification commands.
+> **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
 ## Features
 
 - Next.js storefront with product browsing, search, category filters, details and demo cart.
 - FastAPI commerce API, SQLAlchemy models, session-based anonymous visitors, SQLite WAL and PostgreSQL mode.
-- OpenSearch-backed product search with SQL degradation; Gorse distributed recommendations with local-interest/popularity fallback.
-- Atomic raw-event + outbox persistence, retryable Gorse integration, dataset import from Amazon Reviews 2023 metadata.
+- OpenSearch-backed product search with SQLite FTS5 / SQL LIKE degradation; Gorse distributed recommendations with local-interest/popularity fallback.
+- Atomic raw-event + outbox persistence, batched Gorse integration, Amazon Reviews 2023 product metadata and optional positive review-history import.
 - Separate Compose configurations for Ubuntu A (storage/search/master), Ubuntu B (worker/server), and macOS (web/API).
 
 ## Topology
@@ -71,7 +71,7 @@ docker compose --env-file .env -f infra/macos/compose.yaml exec api python /app/
 curl -X POST -H "X-Admin-Key: $ADMIN_KEY" 'http://127.0.0.1:8000/api/admin/sync?batch=1000'
 ```
 
-The Mac Compose file now runs a `sync` sidecar that invokes `scripts/sync_gorse.py` every 30 seconds. Use `docker compose -f infra/macos/compose.yaml logs -f sync` to inspect failures. Gorse offline models refresh periodically, so local fallback and newest-session reranking are separate from learned Gorse results.
+The Mac Compose file runs a `sync` sidecar that drains successful backlog batches rapidly, then checks again after an idle pause. Use `docker compose -f infra/macos/compose.yaml logs -f sync` to inspect failures. Gorse offline models refresh periodically, while the API also reranks learned candidates using current-session category interest. Recommendations include an attributed slate ID; impression events are recorded only when cards enter the viewport.
 
 ### Database switching
 
@@ -89,7 +89,7 @@ PostgreSQL in Ubuntu A's Compose is initially **Gorse-only**, not a pre-created 
 
 ### Security
 
-This is a **LAN-only prototype**. The OpenSearch security plugin is disabled for development; never forward 9200 to the Internet. Use firewall allowlists, private Wi-Fi, and strong random session/admin secrets. Gorse upstream REST API must not be exposed to untrusted clients; only the FastAPI gateway calls it. No production auth, payments, stock, seller or checkout fulfillment is implemented. Anonymous sessions are not account authentication; do not use this as a real commerce platform.
+This is a **LAN-only prototype**. The OpenSearch security plugin is disabled for development; never forward 9200 to the Internet. Use firewall allowlists, private Wi-Fi, and strong random session/admin secrets. Gorse upstream REST API must not be exposed to untrusted clients; only the FastAPI gateway calls it. No production auth, payments, stock, seller or checkout fulfillment is implemented. Anonymous clients cannot submit simulated purchases, but rate limiting and abuse detection remain pending. Anonymous sessions are not account authentication; do not use this as a real commerce platform.
 
 ### Verification and tests
 
@@ -119,3 +119,11 @@ V1 is a runnable research baseline, not full Taobao/JD functionality: single-nod
 ### Testing limitations
 
 Local tests verify SQLite/API workflows and mocked Gorse failure handling, but no Docker integration was run in the code-review environment. The project is still a LAN research prototype; consult the audit ledger before attempting production use.
+
+### V1.3 local data model and upgrade
+
+- Lists and recommendations intentionally omit long descriptions; fetch `/api/products/{id}` for details.
+- SQLite FTS5 is optional and searches indexed words; complex Chinese segmentation, exact substring semantics, and PostgreSQL full-text performance require further work.
+- Unique-visitor popularity is transactional but counts only events observed after V1.3 deployment, without historical backfill or time decay.
+- The optional review importer uses high-rated Amazon reviews as historical positives, not as an unbiased clickstream.
+- Back up the SQLite volume before the additive schema upgrade; follow [V1.3 migration notes](docs/ITERATION_V1_3.md).

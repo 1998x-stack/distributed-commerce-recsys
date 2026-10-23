@@ -62,9 +62,10 @@ def normalize(raw, index, demo=False):
     rating = raw.get('average_rating') or 0
     return Product(id='amazon:' + str(asin), source='amazon-2023', source_id=str(asin),
                    title=str(raw['title'])[:500], description=str(desc)[:10000],
-                   category=str(cats[0])[:100] if cats else 'Other', brand=str(raw.get('store') or '')[:100],
+                   category=str(cats[0] if cats else (raw.get('main_category') or 'Other'))[:100], brand=str(raw.get('store') or '')[:100],
                    price=parse_price(raw.get('price')), currency='USD', image_url=str(url or ''),
-                   rating=float(rating) if isinstance(rating, (int, float)) else 0)
+                   rating=float(rating) if isinstance(rating, (int, float)) else 0,
+                   rating_count=max(0, int(raw.get('rating_number') or 0)))
 
 
 def import_rows(rows, limit, demo=False):
@@ -79,7 +80,8 @@ def import_rows(rows, limit, demo=False):
                 continue
             db.merge(product)
             payload = {'ItemId': product.id, 'IsHidden': False, 'Categories': [product.category],
-                       'Labels': {'brand': [product.brand] if product.brand else [], 'category': [product.category]}}
+                       'Labels': {'brand': [product.brand] if product.brand else [], 'category': [product.category]},
+                       'Timestamp': '2023-12-31T00:00:00Z' if product.source == 'amazon-2023' else '2026-01-01T00:00:00Z'}
             outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'gorse-item-' + product.id))
             new_payload = json.dumps(payload, sort_keys=True, ensure_ascii=False)
             record = db.get(Outbox, outbox_id)

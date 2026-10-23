@@ -18,12 +18,21 @@ services:
       GORSE_API_KEY: ${GORSE_API_KEY:-}
     volumes: ["commerce_data:/app/data"]
     ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=2)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      options: {max-size: "10m", max-file: "3"}
   sync:
     build:
       context: ../..
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
-    depends_on: [api]
+    depends_on:
+      api: {condition: service_healthy}
     environment:
       API_URL: http://api:8000
       ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
@@ -32,8 +41,11 @@ services:
     build:
       context: ../..
       dockerfile: apps/storefront/Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:8000
     restart: unless-stopped
-    depends_on: [api]
+    depends_on:
+      api: {condition: service_healthy}
     environment:
       API_INTERNAL_URL: http://api:8000
     ports: ["${MAC_IP:?Set MAC_IP}:3000:3000"]

@@ -24,3 +24,27 @@ jobs:
         working-directory: apps/storefront
       - run: npm run build
         working-directory: apps/storefront
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: commerce_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_TEST_URL: postgresql://commerce:ci-only-password@127.0.0.1:5432/commerce_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r services/api/requirements.txt pytest
+      - run: PYTHONPATH=services/api pytest -q tests/test_postgres_optional.py

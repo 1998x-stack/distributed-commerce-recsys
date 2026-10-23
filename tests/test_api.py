@@ -212,5 +212,107 @@ def test_search_provider_falls_back_when_down(harness, monkeypatch):
 
     monkeypatch.setattr(app.httpx, 'AsyncClient', factory)
     result = client.get('/api/search', params={'q': 'Headphones'}).json()
-    assert result['provider'] == 'sql'
+    assert result['provider'] == 'sqlite-fts5'
     assert result['items'][0]['id'] == 'test:headphone'
+
+
+def test_cart_idempotent_and_atomic(harness):
+    app, client = harness
+    path = '/api/cart'
+    body = {'product_id': 'test:headphone', 'quantity': 3}
+    headers = {'Idempotency-Key': 'cart-step-1'}
+    assert client.post(path, json=body, headers=headers).status_code == 201
+    r = client.post(path, json=body, headers=headers)
+    assert r.status_code == 200 and r.json()['duplicate'] is True
+    assert client.post(path, json={**body, 'quantity': 4}, headers=headers).status_code == 409
+    assert client.get(path).json()['items'][0]['quantity'] == 3
+    with app.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(app.Event)) == 1
+        assert db.scalar(select(func.count()).select_from(app.CartOperation)) == 1
+
+
+def test_event_duplicate_returns_200_and_purchase_is_server_only(harness):
+    _, client = harness
+    body = {'product_id': 'test:headphone', 'event_type': 'click', 'idempotency_key': 'click-a'}
+    assert client.post('/api/events', json=body).status_code == 201
+    assert client.post('/api/events', json=body).status_code == 200
+    assert client.post('/api/events', json={**body, 'event_type': 'purchase_demo'}).status_code == 422
+
+
+def test_product_cards_are_slim_but_details_are_full(harness):
+    app, client = harness
+    with app.SessionLocal() as db:
+        db.get(app.Product, 'test:headphone').description = 'description-' * 1000
+        db.commit()
+    card = client.get('/api/products').json()['items'][0]
+    assert 'description' not in card
+    detail = client.get('/api/products/test:headphone').json()
+    assert len(detail['description']) > 1000
+
+
+def test_sqlite_fts5_updates_and_punctuation(harness):
+    app, client = harness
+    assert client.get('/api/search', params={'q': 'Headphones'}).json()['provider'] == 'sqlite-fts5'
+    with app.SessionLocal() as db:
+        db.get(app.Product, 'test:headphone').title = 'Quantum Acoustics'
+        db.commit()
+    assert client.get('/api/search', params={'q': 'Quantum'}).json()['items'][0]['id'] == 'test:headphone'
+    assert client.get('/api/search', params={'q': '%'}).json()['items'][0]['id'] == 'test:percent'
+
+
+def test_popularity_counts_distinct_visitors(harness):
+    app, client = harness
+    for _ in range(5):
+        assert client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'}).status_code == 201
+    other = TestClient(app.app)
+    assert other.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'favorite'}).status_code == 201
+    with app.SessionLocal() as db:
+        assert db.get(app.ProductStat, 'test:headphone').unique_visitors == 2
+
+
+def test_category_diversity_and_attributed_recommendations(harness):
+    app, client = harness
+    with app.SessionLocal() as db:
+        db.add_all(app.Product(id=f'cat:a:{i}', source='test', title='Alpha', category='A', rating=5.0)
+                   for i in range(15))
+        db.add_all(app.Product(id=f'cat:b:{i}', source='test', title='Beta', category='B', rating=4.8)
+                   for i in range(15))
+        db.commit()
+    for i in range(3):
+        client.post('/api/events', json={'product_id': f'cat:a:{i}', 'event_type': 'click'})
+    client.post('/api/events', json={'product_id': 'cat:b:0', 'event_type': 'favorite'})
+    out = client.get('/api/recommendations/home', params={'limit': 8}).json()
+    assert len(out['items']) == 8
+    assert max(sum(p['category'] == cat for p in out['items']) for cat in ['A','B']) <= 4
+    assert len(out['request_id']) == 36
+    assert [p['position'] for p in out['placements']] == list(range(8))
+
+
+def test_exposure_batch_is_idempotent_and_not_popularity(harness):
+    app, client = harness
+    body = {'events': [{'product_id': 'test:headphone', 'event_type': 'impression', 'request_id': 'slate-1', 'position': 0},
+                       {'product_id': 'test:speaker', 'event_type': 'impression', 'request_id': 'slate-1', 'position': 1}]}
+    assert client.post('/api/events/batch', json=body).json()['recorded'] == 2
+    again = client.post('/api/events/batch', json=body)
+    assert again.status_code == 200 and again.json()['duplicates'] == 2
+    with app.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(app.Event)) == 2
+        assert db.scalar(select(func.count()).select_from(app.Outbox)) == 2
+        assert db.scalar(select(func.count()).select_from(app.ProductStat)) == 0
+
+
+def test_gorse_feedback_batches_not_one_request_per_row(harness, monkeypatch):
+    app, client = harness
+    for _ in range(3):
+        client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'})
+    app.CONFIG['services']['gorse'] = 'http://mock-gorse'
+    requests = []
+    original = httpx.AsyncClient
+    def handler(req):
+        requests.append(json.loads(req.content))
+        return httpx.Response(200, json={'RowAffected': len(requests[-1])})
+    monkeypatch.setattr(app.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    r = client.post('/api/admin/sync?batch=1000', headers={'X-Admin-Key': 'testing-admin-key'})
+    assert r.status_code == 200
+    assert r.json()['delivered'] == 3
+    assert len(requests) == 1 and len(requests[0]) == 3

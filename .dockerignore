@@ -1,0 +1,14 @@
+**/.env
+**/.venv
+**/node_modules
+**/.next
+**/__pycache__
+**/.pytest_cache
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/data
+**/*.parquet
+**/*.jsonl
+**/*.jsonl.gz
+.git
