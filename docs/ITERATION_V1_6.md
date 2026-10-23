@@ -57,12 +57,12 @@ The source file is verified as a single SQLite read snapshot; writers should sti
 The script `scripts/bench_api.py` reports status distribution, throughput, P50/P95/P99. Only GET requests to `/api/products`, `/api/search`, `/api/recommendations` or `/health` are accepted, and the base must use localhost or a literal private/loopback IP. It rejects public destinations and limits the benchmark to 2,000 requests with concurrency <=32.
 
 ```bash
-# Mac LAN address; test from each Ubuntu and from Mac, record host CPU/RAM and dataset size.
-python scripts/bench_api.py --url http://192.168.1.103:8000 \
+# On Ubuntu, benchmark through the LAN-exposed Next.js /api/* proxy (port 3000).
+python scripts/bench_api.py --url http://192.168.1.103:3000 \
   --path '/api/search?q=headphones' --requests 200 --concurrency 8
 ```
 
-Results depend on catalog size, cache warmth, OpenSearch/Gorse health, network and client placement. Run a separate cold/warm benchmark and do **not** treat a localhost mock test as three-machine throughput verification. The default endpoint tests the business API directly; for full browser latency additionally measure the storefront proxy separately.
+For API-direct timing run the same script **on macOS** using `--url http://127.0.0.1:8000` (Compose intentionally binds API port 8000 to loopback). From Ubuntu use the storefront proxy at the Mac LAN IP on port 3000. Results depend on catalog size, cache warmth, OpenSearch/Gorse health, network and client placement. Run separate cold/warm benchmarks; a localhost mock test is not three-machine throughput verification.
 
 ## 4. Verification and remaining work
 
