@@ -24,6 +24,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
 from app import Base  # noqa: E402
 
+# Operational gate is a singleton control row, not business data. It is
+# initialized on the empty target by Alembic and intentionally not copied.
+def business_tables():
+    return [t for t in Base.metadata.sorted_tables if t.name != "search_maintenance"]
+
+
 
 def canonical(row: dict, table) -> bytes:
     cleaned = {}
@@ -88,14 +94,14 @@ def source_snapshot(sqlite_path: Path):
 
 def check_revision_sqlite(conn):
     found = conn.execute('SELECT version_num FROM alembic_version').fetchone()
-    if not found or found[0] != '0001_v15_baseline':
+    if not found or found[0] != '0002_v17_search_gate':
         raise ValueError('SQLite source needs alembic upgrade head (V1.5 or newer)')
 
 
 def validate_source(conn):
     check_revision_sqlite(conn)
     counts = {}
-    for table in Base.metadata.sorted_tables:
+    for table in business_tables():
         expected = {c.name for c in table.columns}
         actual = {r['name'] for r in conn.execute(f'PRAGMA table_info("{table.name}")')}
         if not expected <= actual:
@@ -122,7 +128,7 @@ def copy_to_postgres(conn, url: str, *, batch_size: int = 500):
     pg = create_engine(pg_url, pool_pre_ping=True, connect_args={'connect_timeout': 10})
     try:
         with pg.begin() as dest:
-            tables = Base.metadata.sorted_tables
+            tables = business_tables()
             expected_tables = {t.name for t in tables}
             if not expected_tables <= set(inspect(dest).get_table_names()):
                 raise ValueError('Destination schema missing; run Alembic upgrade head on PostgreSQL first')
@@ -131,7 +137,7 @@ def copy_to_postgres(conn, url: str, *, batch_size: int = 500):
             quoted_tables = ', '.join('"' + t.name + '"' for t in tables)
             dest.execute(text(f'LOCK TABLE {quoted_tables} IN ACCESS EXCLUSIVE MODE'))
             revision = dest.execute(text('SELECT version_num FROM alembic_version')).scalar_one_or_none()
-            if revision != '0001_v15_baseline':
+            if revision != '0002_v17_search_gate':
                 raise ValueError('PostgreSQL target schema revision does not match SQLite source')
             counts = {}
             for table in tables:

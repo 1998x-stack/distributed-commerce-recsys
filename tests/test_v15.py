@@ -32,7 +32,7 @@ def test_alembic_fresh_and_idempotent_upgrade(tmp_path, monkeypatch):
     run_alembic(path, monkeypatch)
     run_alembic(path, monkeypatch)
     with create_engine('sqlite:///' + str(path)).connect() as conn:
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one() == '0001_v15_baseline'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one() == '0002_v17_search_gate'
         assert conn.execute(text('SELECT count(*) FROM products')).scalar_one() == 0
         assert conn.execute(text("SELECT name FROM sqlite_master WHERE name='products_fts'")).scalar_one() == 'products_fts'
 
@@ -58,7 +58,7 @@ def test_alembic_adopts_existing_v14_data(tmp_path, monkeypatch):
     run_alembic(path, monkeypatch)
     with create_engine('sqlite:///' + str(path)).connect() as conn:
         assert conn.execute(text("SELECT title FROM products WHERE id='legacy:1'")).scalar_one() == 'Legacy product'
-        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one() == '0001_v15_baseline'
+        assert conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one() == '0002_v17_search_gate'
 
 
 def test_search_sync_partial_failures_and_retry(harness):

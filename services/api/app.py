@@ -13,6 +13,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from operational import CircuitBreaker, TokenBuckets, MetricsCounters
+from search_coordination import sync_gate_open
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -161,6 +162,14 @@ class Outbox(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class SearchMaintenance(Base):
+    """Single persisted rebuild lease; coordinates API sync and offline reindexer."""
+    __tablename__ = 'search_maintenance'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class EventInput(BaseModel):
     product_id: str = Field(min_length=1, max_length=128)
     event_type: Literal['impression', 'click', 'favorite', 'cart']
@@ -208,6 +217,7 @@ def upgrade_existing_schema(conn):
     for table in Base.metadata.sorted_tables:
         for index in table.indexes:
             index.create(bind=conn, checkfirst=True)
+    conn.execute(insert_on_conflict(SearchMaintenance).values(id=1).on_conflict_do_nothing(index_elements=['id']))
     if conn.dialect.name == 'sqlite':
         install_sqlite_fts(conn)
 
@@ -226,8 +236,8 @@ def check_schema_revision():
             version = conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one()
         except Exception as exc:
             raise RuntimeError('Database not migrated; run `alembic upgrade head` first') from exc
-        if version != '0001_v15_baseline':
-            raise RuntimeError(f'Expected schema 0001_v15_baseline, found {version!r}; run Alembic')
+        if version != '0002_v17_search_gate':
+            raise RuntimeError(f'Expected schema 0002_v17_search_gate, found {version!r}; run Alembic')
 
 
 def install_sqlite_fts(conn):
@@ -741,7 +751,14 @@ def metrics(db: Session = Depends(db_session)):
     if oldest is not None and oldest.tzinfo is None:
         oldest = oldest.replace(tzinfo=timezone.utc)
     age_seconds = max(0, int((datetime.now(timezone.utc) - oldest).total_seconds())) if oldest else None
+    gate = db.get(SearchMaintenance, 1)
+    gate_until = gate.lease_until if gate else None
+    if gate_until is not None and gate_until.tzinfo is None:
+        gate_until = gate_until.replace(tzinfo=timezone.utc)
+    gate_remaining = max(0, int((gate_until - datetime.now(timezone.utc)).total_seconds())) if gate_until else 0
     return {'products': db.scalar(select(func.count()).select_from(Product)),
+            'search_rebuild_active': bool(gate and gate.owner and gate_remaining > 0),
+            'search_rebuild_lease_remaining_seconds': gate_remaining,
             'search_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind == 'search', Outbox.delivered.is_(False))),
             'gorse_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind.in_(['item', 'feedback']), Outbox.delivered.is_(False))),
             'events': db.scalar(select(func.count()).select_from(Event)),
@@ -836,6 +853,11 @@ def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
         raise HTTPException(503, 'OPENSEARCH_URL not configured')
     now = datetime.now(timezone.utc)
     owner = str(uuid.uuid4())
+    # A SQL write-lock gates claim + commit atomically against reindex start.
+    # Do not claim while the indexer is building a new alias generation.
+    if not sync_gate_open(db, SearchMaintenance):
+        db.rollback()
+        raise HTTPException(423, 'Search rebuild in progress; sync will retry')
     available = or_(Outbox.lease_until.is_(None), Outbox.lease_until < now)
     due = or_(Outbox.next_attempt_at.is_(None), Outbox.next_attempt_at <= now)
     pending = (select(Outbox.id).where(Outbox.kind == 'search', Outbox.delivered.is_(False),

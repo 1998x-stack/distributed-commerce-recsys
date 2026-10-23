@@ -16,7 +16,8 @@ from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Product, SessionLocal, search_document  # noqa: E402
+from app import Product, Outbox, SearchMaintenance, SessionLocal, search_document  # noqa: E402
+from search_coordination import begin_rebuild, renew_rebuild, end_rebuild, SearchRebuildBusy  # noqa: E402
 
 ALIAS = 'commerce-products'
 MAPPING = {'settings': {'index': {'number_of_shards': 1, 'number_of_replicas': 0}},
@@ -31,7 +32,17 @@ def index_catalog(base: str, batch_size: int = 250):
     generation = f'{ALIAS}-v{uuid.uuid4().hex[:12]}'
     count = 0
     attempted_promotion = False
-    with httpx.Client(timeout=60.0) as client:
+    owner = begin_rebuild(SessionLocal, SearchMaintenance, Outbox)
+    try:
+        return _build_catalog(base, batch_size, generation, owner)
+    finally:
+        end_rebuild(SessionLocal, SearchMaintenance, owner)
+
+
+def _build_catalog(base, batch_size, generation, owner):
+    count = 0
+    attempted_promotion = False
+    with httpx.Client(timeout=60.0, trust_env=False) as client:
         reply = client.put(f'{base}/{generation}', json=MAPPING)
         reply.raise_for_status()
         try:
@@ -41,12 +52,15 @@ def index_catalog(base: str, batch_size: int = 250):
                 for p in result:
                     buffer.append(search_document(p))
                     if len(buffer) >= batch_size:
+                        renew_rebuild(SessionLocal, SearchMaintenance, owner)
                         write_bulk(client, base, generation, buffer)
                         count += len(buffer)
                         buffer.clear()
                 if buffer:
+                    renew_rebuild(SessionLocal, SearchMaintenance, owner)
                     write_bulk(client, base, generation, buffer)
                     count += len(buffer)
+            renew_rebuild(SessionLocal, SearchMaintenance, owner)
             client.post(f'{base}/{generation}/_refresh').raise_for_status()
             # Safe promotion: do not delete the live index until indexing succeeded.
             aliases = client.get(f'{base}/_alias/{ALIAS}')
@@ -63,6 +77,7 @@ def index_catalog(base: str, batch_size: int = 250):
             elif legacy.status_code not in (200, 404):
                 legacy.raise_for_status()
             actions.append({'add': {'index': generation, 'alias': ALIAS}})
+            renew_rebuild(SessionLocal, SearchMaintenance, owner)
             attempted_promotion = True
             response = client.post(f'{base}/_aliases', json={'actions': actions})
             response.raise_for_status()

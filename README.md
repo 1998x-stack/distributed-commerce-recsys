@@ -146,3 +146,25 @@ Local tests verify SQLite/API workflows and mocked Gorse failure handling, but n
 - `scripts/backfill_popularity.py` rebuilds unique-visitor counts from historical positive feedback entirely inside SQLite/PostgreSQL. Stop writes while running.
 - Mac API and sync containers run as non-root users with read-only root filesystems; a one-shot `volume-init` handles existing data volume permissions.
 - **Before upgrading:** follow the backup, schema and migration steps in [the V1.4 guide](docs/ITERATION_V1_4.md).
+
+
+## V1.7: coordinated search reindex & diagnostics
+
+V1.7 adds the SQL-backed `search_maintenance` gate and Alembic revision
+`0002_v17_search_gate`. During a full OpenSearch alias rebuild, the incremental
+search Outbox sync endpoint responds HTTP 423, preserves pending events and
+resumes after promotion. Current product imports remain permitted and their
+updates replay after the alias swap. One in-flight sync must finish before
+indexing begins; duplicate rebuilds are rejected. See
+[docs/ITERATION_V1_7.md](docs/ITERATION_V1_7.md) for the migration, operating
+procedure, eventual-consistency boundaries, and restoration instructions.
+
+Read-only LAN status from another machine:
+
+```bash
+python scripts/diagnose_lan.py --mac 192.168.1.20 --ubuntu-a 192.168.1.21 --ubuntu-b 192.168.1.22 --json
+```
+
+These sample IPs must be replaced with your actual private LAN addresses.
+No physical three-node outage or live Gorse/OpenSearch end-to-end test has yet
+been performed in this development environment.
