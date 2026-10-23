@@ -2,7 +2,7 @@
 
 ## Data plane
 
-- **Business SoT**: SQLite on Mac writable only by FastAPI (default). Optional PostgreSQL using SQLAlchemy engine and same ORM classes.
+- **Business SoT**: SQLite on Mac writable only by FastAPI (default). Optional PostgreSQL using SQLAlchemy engine and same ORM classes; Ubuntu A has an opt-in `business-postgres` Compose profile.
 - **Index**: OpenSearch on Ubuntu A, imported from authoritative product rows; any failed search request falls back to SQL query.
 - **Recommendation**: Gorse Master on A, Gorse Worker/Server on B; Gorse has independent PostgreSQL storage and Redis cache.
 - **Behavior**: Browser -> FastAPI -> SQL raw Event and durable Outbox in one transaction. The sync worker POSTs items/feedback to Gorse. Raw events contain repeated interactions; Gorse may coalesce feedback by key.

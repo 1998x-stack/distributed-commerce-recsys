@@ -14,6 +14,17 @@ services:
       interval: 10s
       retries: 10
     networks: [backend]
+  commerce-postgres:
+    profiles: [business-postgres]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: commerce
+      POSTGRES_PASSWORD: ${COMMERCE_PG_PASSWORD:?Set COMMERCE_PG_PASSWORD in .env}
+      POSTGRES_DB: commerce
+    volumes: ["commerce_pg_data:/var/lib/postgresql/data"]
+    ports: ["${UBUNTU_A_IP}:5432:5432"]
+    networks: [backend]
   redis:
     image: redis:7.4-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -55,6 +66,7 @@ networks:
   backend: {}
 volumes:
   postgres_data: {}
+  commerce_pg_data: {}
   redis_data: {}
   opensearch_data: {}
   gorse_master_data: {}

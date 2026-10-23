@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,13 +121,14 @@ class CartInput(BaseModel):
     quantity: int = Field(default=1, ge=1, le=20)
 
 
-app = FastAPI(title='Distributed Commerce RecSys API', version='0.1.0')
-app.add_middleware(SessionMiddleware, secret_key=os.getenv('SESSION_SECRET', 'development-only-change-me'), same_site='lax', https_only=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
-
-
-@app.on_event('startup')
-def startup():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
+    yield
+
+
+app = FastAPI(title='Distributed Commerce RecSys API', version='0.1.1', lifespan=lifespan)
+app.add_middleware(SessionMiddleware, secret_key=os.getenv('SESSION_SECRET', 'development-only-change-me'), same_site='lax', https_only=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
 
 
 def db_session():
@@ -338,7 +340,7 @@ async def sync(batch: int = Query(100, ge=1, le=1000), db: Session = Depends(db_
         for row in rows:
             try:
                 if row.kind == 'feedback':
-                    response = await client.post(url + '/api/feedback', json=[json.loads(row.payload)])
+                    response = await client.put(url + '/api/feedback', json=[json.loads(row.payload)])
                 else:
                     response = await client.post(url + '/api/items', json=[json.loads(row.payload)])
                 response.raise_for_status()

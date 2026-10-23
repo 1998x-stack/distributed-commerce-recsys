@@ -18,8 +18,7 @@ cache_size = 100
 positive_feedback_types = ["click", "favorite", "cart", "purchase_demo"]
 read_feedback_types = ["click"]
 
-[[recommend.non-personalized]]
-name = "latest"
+# Built-in latest recommender is used for cold start.
 
 [recommend.collaborative]
 type = "mf"

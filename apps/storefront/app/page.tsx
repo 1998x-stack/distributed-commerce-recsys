@@ -52,7 +52,7 @@ export default function Home() {
       <div className="card-bottom"><strong>{p.currency==='USD'?'$':'¥'}{p.price.toFixed(2)}</strong><button className="add" onClick={()=>addCart(p)} aria-label="加入购物车">+</button></div>
     </div>
   </article>;
-  return <main>
+  return <main className="min-h-screen">
     <div className="announcement">DISTRIBUTED COMMERCE LAB <span>·</span> 三节点局域网推荐实验平台 <ArrowRight size={12}/></div>
     <header className="topbar"><div className="logo"><div className="logo-mark">◈</div><span>orbit<span className="logo-thin">market</span></span></div>
       <div className="searchbar"><Search size={19}/><input value={draft} placeholder="搜索商品、品牌、分类..." onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==='Enter'&&setQuery(draft.trim())}/><button onClick={()=>setQuery(draft.trim())}>搜索</button></div>

@@ -83,7 +83,15 @@ DB_DRIVER=postgresql
 DATABASE_URL_POSTGRES=postgresql://commerce:strong-secret@UBUNTU_A_IP:5432/commerce
 ```
 
-PostgreSQL in Ubuntu A's Compose is initially **Gorse-only**, not a pre-created commerce database. For PostgreSQL business mode provision a **separate role/database** and publish access on the private LAN with authentication and firewall rules; do not reuse Gorse's credentials/database.
+PostgreSQL in Ubuntu A's default Compose is **Gorse-only**. Optional business PostgreSQL is a separate Compose-profile service with its own role, database and private-LAN port:
+
+```bash
+# On Ubuntu A after setting COMMERCE_PG_PASSWORD and DATABASE_URL_POSTGRES
+# Choose the profile to launch the additional business PostgreSQL instance
+docker compose --env-file .env -f infra/ubuntu-a/compose.yaml --profile business-postgres up -d
+```
+
+Then set `DB_DRIVER=postgresql` on Mac and recreate the API container. Use matching passwords and private subnet firewall; there is no automatic SQLite-to-PostgreSQL data migration. Never reuse Gorse's PostgreSQL database for commerce business tables.
 
 ### Security
 
@@ -98,6 +106,10 @@ bash scripts/check-lan.sh
 curl http://127.0.0.1:8000/api/products
 curl 'http://127.0.0.1:8000/api/search?q=headphones'
 ```
+
+## Algorithms and evaluation
+
+Optional RecBole and deterministic item-co-visitation/offline evaluation are in `ml/`. See `ml/README.md`. The default UI is styled with Tailwind and custom CSS.
 
 ## Data sources
 

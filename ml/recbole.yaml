@@ -1,0 +1,26 @@
+# Research config, requires optional PyTorch + RecBole installation.
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+RATING_FIELD: rating
+TIME_FIELD: timestamp
+load_col:
+  inter: [user_id, item_id, rating, timestamp]
+field_separator: "\t"
+seq_separator: " "
+metrics: [Recall, NDCG, MRR]
+topk: [10, 20]
+valid_metric: NDCG@10
+train_batch_size: 512
+eval_batch_size: 1024
+learning_rate: 0.001
+epochs: 30
+seed: 42
+reproducibility: true
+# Event time split. Dataset sparse users may be filtered by RecBole.
+eval_args:
+  group_by: user
+  order: TO
+  split: {'LS': 'valid_and_test'}
+  mode: full
+user_inter_num_interval: '[3,inf)'
+item_inter_num_interval: '[1,inf)'

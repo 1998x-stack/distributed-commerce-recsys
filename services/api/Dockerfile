@@ -6,5 +6,6 @@ COPY services/api/app.py /app/app.py
 COPY config /app/config
 COPY scripts /app/scripts
 ENV APP_CONFIG=/app/config/app.yaml
+ENV PYTHONPATH=/app
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
