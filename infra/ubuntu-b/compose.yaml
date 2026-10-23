@@ -1,0 +1,16 @@
+name: commerce-node-b
+services:
+  gorse-server:
+    image: zhenghaoz/gorse-server:0.5.10
+    restart: unless-stopped
+    command: ["--master-host", "${UBUNTU_A_IP:?Set UBUNTU_A_IP}", "--master-port", "8086", "--http-host", "0.0.0.0", "--http-port", "8087", "--cache-path", "/var/lib/gorse/server_cache.data"]
+    ports: ["${UBUNTU_B_IP:?Set UBUNTU_B_IP}:8087:8087"]
+    volumes: ["gorse_server_data:/var/lib/gorse"]
+  gorse-worker:
+    image: zhenghaoz/gorse-worker:0.5.10
+    restart: unless-stopped
+    command: ["--master-host", "${UBUNTU_A_IP:?Set UBUNTU_A_IP}", "--master-port", "8086", "--http-host", "0.0.0.0", "--http-port", "8089", "--cache-path", "/var/lib/gorse/worker_cache.data"]
+    volumes: ["gorse_worker_data:/var/lib/gorse"]
+volumes:
+  gorse_server_data: {}
+  gorse_worker_data: {}

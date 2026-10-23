@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+data/
+outputs/
+models/
+.DS_Store
+*.gz

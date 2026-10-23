@@ -1,0 +1,33 @@
+# Gorse cluster configuration. Data store is separate from SQLite commerce DB.
+[master]
+host = "0.0.0.0"
+port = 8086
+http_host = "0.0.0.0"
+http_port = 8088
+dashboard_user_name = "admin"
+
+[server]
+default_n = 20
+auto_insert_user = true
+auto_insert_item = true
+
+[recommend]
+cache_size = 100
+
+[recommend.data_source]
+positive_feedback_types = ["click", "favorite", "cart", "purchase_demo"]
+read_feedback_types = ["click"]
+
+[[recommend.non-personalized]]
+name = "latest"
+
+[recommend.collaborative]
+type = "mf"
+fit_period = "60m"
+
+[recommend.ranker]
+type = "fm"
+recommenders = ["latest", "collaborative"]
+
+[recommend.fallback]
+recommenders = ["latest"]

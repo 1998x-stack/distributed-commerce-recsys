@@ -1,0 +1,28 @@
+name: commerce-macos
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_DRIVER: ${DB_DRIVER:-sqlite}
+      SQLITE_PATH: /app/data/commerce.db
+      DATABASE_URL_POSTGRES: ${DATABASE_URL_POSTGRES:-}
+      OPENSEARCH_URL: http://${UBUNTU_A_IP:?Set UBUNTU_A_IP}:9200
+      GORSE_URL: http://${UBUNTU_B_IP:?Set UBUNTU_B_IP}:8087
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
+    volumes: ["commerce_data:/app/data"]
+    ports: ["127.0.0.1:8000:8000"]
+  storefront:
+    build:
+      context: ../..
+      dockerfile: apps/storefront/Dockerfile
+    restart: unless-stopped
+    depends_on: [api]
+    environment:
+      API_INTERNAL_URL: http://api:8000
+    ports: ["${MAC_IP:?Set MAC_IP}:3000:3000"]
+volumes:
+  commerce_data: {}

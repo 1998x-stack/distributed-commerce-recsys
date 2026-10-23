@@ -1,0 +1,7 @@
+database:
+  driver: sqlite
+  sqlite_path: ./data/commerce.db
+  postgres_url: ''
+services:
+  search: ''
+  gorse: ''

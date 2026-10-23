@@ -1,0 +1,60 @@
+name: commerce-node-a
+services:
+  gorse-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gorse
+      POSTGRES_PASSWORD: ${GORSE_PG_PASSWORD:?Set GORSE_PG_PASSWORD in .env}
+      POSTGRES_DB: gorse
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gorse -d gorse"]
+      interval: 10s
+      retries: 10
+    networks: [backend]
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    volumes: ["redis_data:/data"]
+    networks: [backend]
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: 'true'
+      DISABLE_SECURITY_PLUGIN: 'true'
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "${UBUNTU_A_IP:?Set UBUNTU_A_IP}:9200:9200"
+    volumes: ["opensearch_data:/usr/share/opensearch/data"]
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    networks: [backend]
+  gorse-master:
+    image: zhenghaoz/gorse-master:0.5.10
+    restart: unless-stopped
+    depends_on:
+      gorse-postgres: {condition: service_healthy}
+    environment:
+      GORSE_DATA_STORE: postgres://gorse:${GORSE_PG_PASSWORD}@gorse-postgres:5432/gorse?sslmode=disable
+      GORSE_CACHE_STORE: redis://redis:6379/0
+      GORSE_DASHBOARD_PASSWORD: ${GORSE_DASHBOARD_PASSWORD:?Set GORSE_DASHBOARD_PASSWORD in .env}
+    command: ["-c", "/etc/gorse/config.toml", "--cache-path", "/var/lib/gorse/cache.data"]
+    volumes:
+      - ../../config/gorse.toml:/etc/gorse/config.toml:ro
+      - gorse_master_data:/var/lib/gorse
+    ports:
+      - "${UBUNTU_A_IP}:8086:8086"
+      - "${UBUNTU_A_IP}:8088:8088"
+    networks: [backend]
+networks:
+  backend: {}
+volumes:
+  postgres_data: {}
+  redis_data: {}
+  opensearch_data: {}
+  gorse_master_data: {}
