@@ -10,12 +10,11 @@ import math
 import json
 import re
 import sys
-import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Product, Outbox, SessionLocal, initialize_schema, check_schema_revision, search_document  # noqa: E402
+from app import Product, SessionLocal, initialize_schema, check_schema_revision, queue_catalog_updates  # noqa: E402
 
 DEMO = [
  ('Wireless Studio Headphones', 'Audio', 'Novus', 79.95), ('Compact Bluetooth Earbuds', 'Audio', 'Sonora', 49.90),
@@ -49,7 +48,7 @@ def normalize(raw, index, demo=False):
         source_id = str(index)
         return Product(id=f'demo:{source_id}', source='demo', source_id=source_id, title=name,
                        description=f'{brand} {name}. Sample item for local demo; not offered for sale.',
-                       category=cat, brand=brand, price=price, currency='USD', rating=4.3 + (index % 7) * .1)
+                       category=cat, brand=brand, price=price, currency='USD', rating=4.3 + (index % 7) * .1, is_active=True)
     asin = raw.get('parent_asin') or raw.get('asin')
     if not asin or not raw.get('title'):
         return None
@@ -66,7 +65,7 @@ def normalize(raw, index, demo=False):
                    category=str(cats[0] if cats else (raw.get('main_category') or 'Other'))[:100], brand=str(raw.get('store') or '')[:100],
                    price=parse_price(raw.get('price')), currency='USD', image_url=str(url or ''),
                    rating=float(rating) if isinstance(rating, (int, float)) else 0,
-                   rating_count=max(0, int(raw.get('rating_number') or 0)))
+                   rating_count=max(0, int(raw.get('rating_number') or 0)), is_active=True)
 
 
 def import_rows(rows, limit, demo=False):
@@ -82,40 +81,13 @@ def import_rows(rows, limit, demo=False):
             product = normalize(raw, i, demo)
             if product is None:
                 continue
+            # A routine feed refresh must not undo an explicit administrator takedown.
+            # Restoring a withdrawn item requires the authenticated availability API.
+            existing = db.get(Product, product.id)
+            if existing is not None:
+                product.is_active = existing.is_active
             db.merge(product)
-            payload = {'ItemId': product.id, 'IsHidden': False, 'Categories': [product.category],
-                       'Labels': {'brand': [product.brand] if product.brand else [], 'category': [product.category]},
-                       'Timestamp': '2023-12-31T00:00:00Z' if product.source == 'amazon-2023' else '2026-01-01T00:00:00Z'}
-            outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'gorse-item-' + product.id))
-            new_payload = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-            record = db.get(Outbox, outbox_id)
-            if record is None:
-                db.add(Outbox(id=outbox_id, kind='item', payload=new_payload))
-            elif record.payload != new_payload:
-                # Requeue changed metadata even when the old version was already sent.
-                # Cancel any in-flight lease: a stale delivery must never ACK the new payload.
-                record.payload = new_payload
-                record.delivered = False
-                record.lease_owner = None
-                record.lease_until = None
-                record.next_attempt_at = None
-                record.attempts = 0
-                record.last_error = None
-            # Track catalog mutations separately from Gorse's feedback queue.
-            search_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'search-item-' + product.id))
-            search_payload = json.dumps(search_document(product), sort_keys=True, ensure_ascii=False)
-            search_row = db.get(Outbox, search_id)
-            if search_row is None:
-                db.add(Outbox(id=search_id, kind='search', payload=search_payload))
-            elif search_row.payload != search_payload:
-                search_row.payload = search_payload
-                search_row.delivered = False
-                search_row.delivered_at = None
-                search_row.lease_owner = None
-                search_row.lease_until = None
-                search_row.next_attempt_at = None
-                search_row.attempts = 0
-                search_row.last_error = None
+            queue_catalog_updates(db, product)
             inserted += 1
             if inserted % 200 == 0:
                 db.commit()

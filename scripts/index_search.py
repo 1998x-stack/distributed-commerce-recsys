@@ -47,7 +47,7 @@ def _build_catalog(base, batch_size, generation, owner):
         reply.raise_for_status()
         try:
             with SessionLocal() as db:
-                result = db.scalars(select(Product).order_by(Product.id).execution_options(yield_per=batch_size))
+                result = db.scalars(select(Product).where(Product.is_active.is_(True)).order_by(Product.id).execution_options(yield_per=batch_size))
                 buffer = []
                 for p in result:
                     buffer.append(search_document(p))

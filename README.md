@@ -4,12 +4,14 @@ A three-machine LAN e-commerce discovery and recommendation research project. **
 
 > **V1.6 evaluation, database copy and LAN benchmark:** [docs/ITERATION_V1_6.md](docs/ITERATION_V1_6.md). **V1.5 migrations and live catalog updates:** [docs/ITERATION_V1_5.md](docs/ITERATION_V1_5.md). Prior **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
+> **V1.8 catalog withdrawal and offline model adapters:** [docs/ITERATION_V1_8.md](docs/ITERATION_V1_8.md).
+
 ## Features
 
 - Next.js storefront with product browsing, search, category filters, details and demo cart.
 - FastAPI commerce API, SQLAlchemy models, session-based anonymous visitors, SQLite WAL and PostgreSQL mode.
 - OpenSearch-backed product search with SQLite FTS5 / SQL LIKE degradation; Gorse distributed recommendations with local-interest/popularity fallback.
-- Alembic schema versioning on production startup and a separate durable OpenSearch incremental-update sidecar.
+- Alembic schema versioning on production startup, catalog soft deletion / recovery, and a separate durable OpenSearch incremental-update sidecar.
 - Atomic raw-event + outbox persistence, batched Gorse integration, Amazon Reviews 2023 product metadata and optional positive review-history import.
 - Separate Compose configurations for Ubuntu A (storage/search/master), Ubuntu B (worker/server), and macOS (web/API).
 
@@ -168,3 +170,24 @@ python scripts/diagnose_lan.py --mac 192.168.1.20 --ubuntu-a 192.168.1.21 --ubun
 These sample IPs must be replaced with your actual private LAN addresses.
 No physical three-node outage or live Gorse/OpenSearch end-to-end test has yet
 been performed in this development environment.
+
+## V1.8: withdraw and restore a product (Mac admin API)
+
+V1.8 database head is `0003_v18_catalog_visibility`. A withdrawn product stays
+in the business database and historic events for evaluation, but becomes
+invisible to catalog, search, recommendations and carts immediately. Both Gorse
+(`IsHidden`) and OpenSearch (bulk `delete`) get durable outbox updates. An Amazon
+metadata re-import will **not** automatically restore a manually withdrawn item.
+
+```bash
+# Run on the Mac host; the admin API binds to 127.0.0.1:8000, not the storefront.
+curl -X PATCH http://127.0.0.1:8000/api/admin/products/demo:0/availability \
+  -H "X-Admin-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"active":false}'
+# Restore the same way using {"active":true}.
+```
+
+Snapshot-trained model scores can now be converted with `ml/adapt_predictions.py`;
+see `ml/README.md`. A read-only manual LAN recovery observer is available via
+`scripts/probe_recovery.py`. See the V1.8 upgrade guide for requirements and
+limitations.

@@ -23,7 +23,7 @@ import httpx
 import yaml
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index, create_engine, event as sqla_event, func, inspect, or_, select, text, update, case
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Index, create_engine, event as sqla_event, func, inspect, or_, select, text, update, case
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
@@ -95,6 +95,7 @@ class Product(Base):
     image_url: Mapped[str] = mapped_column(Text, default='')
     rating: Mapped[float] = mapped_column(Float, default=0)
     rating_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default='1', index=True)
 
 
 class Event(Base):
@@ -182,6 +183,10 @@ class BatchInput(BaseModel):
     events: list[EventInput] = Field(min_length=1, max_length=50)
 
 
+class CatalogAvailability(BaseModel):
+    active: bool
+
+
 class CartInput(BaseModel):
     product_id: str = Field(min_length=1, max_length=128)
     quantity: int = Field(default=1, ge=1, le=20)
@@ -204,6 +209,8 @@ def upgrade_existing_schema(conn):
     columns = {col['name'] for col in inspect(conn).get_columns('products')}
     if 'rating_count' not in columns:
         conn.execute(text('ALTER TABLE products ADD COLUMN rating_count INTEGER NOT NULL DEFAULT 0'))
+    if 'is_active' not in columns:
+        conn.execute(text('ALTER TABLE products ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 1'))
     columns = {col['name'] for col in inspect(conn).get_columns('outbox')}
     for name, datatype in required.items():
         if name not in columns:
@@ -236,8 +243,8 @@ def check_schema_revision():
             version = conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one()
         except Exception as exc:
             raise RuntimeError('Database not migrated; run `alembic upgrade head` first') from exc
-        if version != '0002_v17_search_gate':
-            raise RuntimeError(f'Expected schema 0002_v17_search_gate, found {version!r}; run Alembic')
+        if version != '0003_v18_catalog_visibility':
+            raise RuntimeError(f'Expected schema 0003_v18_catalog_visibility, found {version!r}; run Alembic')
 
 
 def install_sqlite_fts(conn):
@@ -393,7 +400,7 @@ def search_document(product: Product) -> dict:
 
 def ensure_product(db: Session, pid: str) -> Product:
     result = db.get(Product, pid)
-    if result is None:
+    if result is None or not result.is_active:
         raise HTTPException(404, 'Product not found')
     return result
 
@@ -402,6 +409,53 @@ def admin_key(key: str | None = Header(default=None, alias='X-Admin-Key')):
     expected = os.getenv('ADMIN_KEY', '')
     if not expected or not key or not secrets.compare_digest(key, expected):
         raise HTTPException(403, 'Admin authorization required')
+
+
+def queue_catalog_updates(db: Session, product: Product) -> None:
+    """Transactionally persist the latest item + search state.
+
+    One deterministic outbox row per product/kind is safe to retry and keeps
+    large imports bounded. Remote calls are deliberately outside the transaction.
+    """
+    item = {'ItemId': product.id, 'IsHidden': not product.is_active,
+            'Categories': [product.category],
+            'Labels': {'brand': [product.brand] if product.brand else [],
+                       'category': [product.category]},
+            'Timestamp': '2023-12-31T00:00:00Z' if product.source == 'amazon-2023' else '2026-01-01T00:00:00Z'}
+    search = search_document(product) if product.is_active else {'id': product.id, '_op': 'delete'}
+    for kind, namespace, payload in (('item', 'gorse-item-', item),
+                                      ('search', 'search-item-', search)):
+        key = str(uuid.uuid5(uuid.NAMESPACE_URL, namespace + product.id))
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        row = db.get(Outbox, key)
+        if row is None:
+            db.add(Outbox(id=key, kind=kind, payload=encoded))
+        elif row.payload != encoded:
+            row.payload = encoded
+            row.delivered = False
+            row.delivered_at = None
+            row.lease_owner = None
+            row.lease_until = None
+            row.next_attempt_at = None
+            row.attempts = 0
+            row.last_error = None
+
+
+@app.patch('/api/admin/products/{pid}/availability', dependencies=[Depends(admin_key)])
+def set_product_availability(pid: str, payload: CatalogAvailability, db: Session = Depends(db_session)):
+    """Soft-delete/restore a catalog item, without destroying historical events."""
+    product = db.get(Product, pid)
+    if product is None:
+        raise HTTPException(404, 'Product not found')
+    changed = bool(product.is_active) != payload.active
+    if changed:
+        product.is_active = payload.active
+        # Remove items from carts on withdrawal. Prior behavioral events stay.
+        if not payload.active:
+            db.query(Cart).filter(Cart.product_id == pid).delete(synchronize_session=False)
+        queue_catalog_updates(db, product)
+        db.commit()
+    return {'id': pid, 'active': bool(product.is_active), 'changed': changed}
 
 
 @app.get('/health/live')
@@ -427,17 +481,17 @@ def health(db: Session = Depends(db_session)):
 
 @app.get('/api/products')
 def products(category: str = '', limit: int = Query(24, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(db_session)):
-    stmt = select(Product)
+    stmt = select(Product).where(Product.is_active.is_(True))
     if category:
         stmt = stmt.where(Product.category == category)
-    count = db.scalar(select(func.count()).select_from(Product).where(Product.category == category) if category else select(func.count()).select_from(Product))
+    count = db.scalar(select(func.count()).select_from(Product).where(Product.is_active.is_(True), Product.category == category) if category else select(func.count()).select_from(Product).where(Product.is_active.is_(True)))
     rows = db.scalars(stmt.order_by(Product.id).offset(offset).limit(limit)).all()
     return {'items': [as_product(p) for p in rows], 'total': count, 'limit': limit, 'offset': offset}
 
 
 @app.get('/api/categories')
 def categories(db: Session = Depends(db_session)):
-    return [name for name in db.scalars(select(Product.category).distinct().order_by(Product.category)).all() if name]
+    return [name for name in db.scalars(select(Product.category).where(Product.is_active.is_(True)).distinct().order_by(Product.category)).all() if name]
 
 
 @app.get('/api/products/{pid}')
@@ -467,7 +521,7 @@ def search(request: Request, q: str = Query(..., min_length=1, max_length=160), 
             request.app.state.circuits.failure('search')
             logger.warning('Search provider unavailable, using SQL: %s', type(exc).__name__)
     if provider == 'opensearch':
-        mapped = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids))).all()}
+        mapped = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids), Product.is_active.is_(True))).all()}
         items = [as_product(mapped[i]) for i in ids if i in mapped]
     else:
         # FTS5 indexes words on SQLite; punctuation-only requests still use literal LIKE.
@@ -476,7 +530,7 @@ def search(request: Request, q: str = Query(..., min_length=1, max_length=160), 
         if DRIVER == 'sqlite' and terms and len(terms) <= 8:
             try:
                 match = ' AND '.join('"' + term.replace('"', '""') + '"' for term in terms)
-                stmt = select(Product).where(Product.id.in_(
+                stmt = select(Product).where(Product.is_active.is_(True), Product.id.in_(
                     select(Product.id).where(text('products.rowid IN (SELECT rowid FROM products_fts WHERE products_fts MATCH :match)')).params(match=match)))
                 if category:
                     stmt = stmt.where(Product.category == category)
@@ -488,7 +542,7 @@ def search(request: Request, q: str = Query(..., min_length=1, max_length=160), 
         if not fts_used:
             escaped = q.replace('\\', '\\\\').replace('%', r'\%').replace('_', r'\_')
             like = f'%{escaped}%'
-            stmt = select(Product).where(or_(Product.title.ilike(like, escape='\\'), Product.description.ilike(like, escape='\\'), Product.brand.ilike(like, escape='\\')))
+            stmt = select(Product).where(Product.is_active.is_(True), or_(Product.title.ilike(like, escape='\\'), Product.description.ilike(like, escape='\\'), Product.brand.ilike(like, escape='\\')))
             if category:
                 stmt = stmt.where(Product.category == category)
             items = [as_product(p) for p in db.scalars(stmt.order_by(Product.rating.desc(), Product.id).offset(offset).limit(limit)).all()]
@@ -582,7 +636,7 @@ def record_impressions(batch: BatchInput, request: Request, response: Response, 
 @app.get('/api/cart')
 def get_cart(request: Request, db: Session = Depends(db_session)):
     who = visitor(request)
-    cart = db.execute(select(Cart, Product).join(Product, Cart.product_id == Product.id).where(Cart.visitor == who)).all()
+    cart = db.execute(select(Cart, Product).join(Product, Cart.product_id == Product.id).where(Cart.visitor == who, Product.is_active.is_(True))).all()
     return {'items': [{'product': as_product(p), 'quantity': c.quantity} for c, p in cart]}
 
 
@@ -662,7 +716,7 @@ def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: Session
                          .where(Event.visitor == who, Event.event_type.in_(['click', 'favorite', 'cart', 'purchase_demo']))
                          .order_by(Event.at.desc(), Event.id.desc()).limit(120)).all()
     used_ids = {pid for pid, _ in history}
-    category_map = dict(db.execute(select(Product.id, Product.category).where(Product.id.in_(used_ids))).all()) if used_ids else {}
+    category_map = dict(db.execute(select(Product.id, Product.category).where(Product.id.in_(used_ids), Product.is_active.is_(True))).all()) if used_ids else {}
     category_scores: dict[str, float] = defaultdict(float)
     for index, (pid, kind) in enumerate(history):
         if pid in category_map:
@@ -682,21 +736,21 @@ def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: Session
                 candidates[product.id] = product, score, source
 
     if ids:
-        products_by_id = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids))).all()}
+        products_by_id = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids), Product.is_active.is_(True))).all()}
         register((products_by_id[pid] for pid in ids if pid in products_by_id), 'gorse', 30)
 
     # Each category supplies an independent bounded candidate pool, even if Gorse fills the slate.
     for cat, score in sorted(category_scores.items(), key=lambda value: -value[1])[:4]:
-        stmt = select(Product).where(Product.category == cat)
+        stmt = select(Product).where(Product.category == cat, Product.is_active.is_(True))
         if strongly_used:
             stmt = stmt.where(Product.id.not_in(strongly_used))
         register(db.scalars(stmt.order_by(Product.rating.desc(), Product.id).limit(max(12, limit * 2))),
                  'interest', 18 + 12 * score / max_interest)
 
-    stats = select(Product).join(ProductStat, Product.id == ProductStat.product_id).order_by(
+    stats = select(Product).join(ProductStat, Product.id == ProductStat.product_id).where(Product.is_active.is_(True)).order_by(
         ProductStat.unique_visitors.desc(), Product.rating.desc(), Product.id).limit(limit * 4)
     register(db.scalars(stats), 'popular', 12)
-    register(db.scalars(select(Product).order_by(Product.rating.desc(), Product.id).limit(limit * 5)), 'rating', 7)
+    register(db.scalars(select(Product).where(Product.is_active.is_(True)).order_by(Product.rating.desc(), Product.id).limit(limit * 5)), 'rating', 7)
 
     def score(item):
         p, base_score, _ = item
@@ -731,7 +785,7 @@ def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: Session
 def similar(pid: str, limit: int = Query(8, ge=1, le=30), db: Session = Depends(db_session)):
     p = ensure_product(db, pid)
     title_terms = set(re.findall(r'\w+', p.title.lower()))
-    matches = db.scalars(select(Product).where(Product.category == p.category, Product.id != p.id)
+    matches = db.scalars(select(Product).where(Product.category == p.category, Product.id != p.id, Product.is_active.is_(True))
                          .order_by(Product.rating.desc(), Product.id).limit(max(150, limit * 12))).all()
 
     def similarity(other: Product):
@@ -757,6 +811,8 @@ def metrics(db: Session = Depends(db_session)):
         gate_until = gate_until.replace(tzinfo=timezone.utc)
     gate_remaining = max(0, int((gate_until - datetime.now(timezone.utc)).total_seconds())) if gate_until else 0
     return {'products': db.scalar(select(func.count()).select_from(Product)),
+            'active_products': db.scalar(select(func.count()).select_from(Product).where(Product.is_active.is_(True))),
+            'withdrawn_products': db.scalar(select(func.count()).select_from(Product).where(Product.is_active.is_(False))),
             'search_rebuild_active': bool(gate and gate.owner and gate_remaining > 0),
             'search_rebuild_lease_remaining_seconds': gate_remaining,
             'search_pending': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.kind == 'search', Outbox.delivered.is_(False))),
@@ -878,8 +934,12 @@ def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
                 identifier = doc.get('id')
                 if not identifier:
                     raise ValueError('Missing search document id')
-                ndjson.append(json.dumps({'index': {'_index': 'commerce-products', '_id': identifier}}))
-                ndjson.append(json.dumps({k: v for k, v in doc.items() if k != 'id'}, ensure_ascii=False))
+                operation = doc.get('_op', 'index')
+                if operation not in ('index', 'delete'):
+                    raise ValueError('Unsupported search outbox operation')
+                ndjson.append(json.dumps({operation: {'_index': 'commerce-products', '_id': identifier}}))
+                if operation == 'index':
+                    ndjson.append(json.dumps({k: v for k, v in doc.items() if k not in ('id', '_op')}, ensure_ascii=False))
             resp = request.app.state.provider_http.post(
                 base + '/_bulk', content='\n'.join(ndjson) + '\n',
                 headers={'Content-Type': 'application/x-ndjson'}, timeout=20)
@@ -890,10 +950,13 @@ def sync_search(request: Request, batch: int = Query(200, ge=1, le=1000),
             items = result.get('items')
             if not isinstance(items, list) or len(items) != len(chunk):
                 raise ValueError('Malformed OpenSearch bulk response')
-            for row, item in zip(chunk, items):
-                status = item.get('index', {})
+            for row, doc, item in zip(chunk, docs, items):
+                operation = doc.get('_op', 'index')
+                status = item.get(operation, {})
                 code = status.get('status', 0) if isinstance(status, dict) else 0
-                success = isinstance(code, int) and 200 <= code < 300 and not status.get('error')
+                success = isinstance(code, int) and (
+                    200 <= code < 300 or (operation == 'delete' and code == 404 and status.get('result') == 'not_found')
+                ) and not status.get('error')
                 results.append((row.id, success, '' if success else str(status.get('error', status))[:512]))
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
             results.extend((row.id, False, str(exc)[:512]) for row in chunk)

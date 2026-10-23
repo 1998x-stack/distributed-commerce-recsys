@@ -94,7 +94,7 @@ def source_snapshot(sqlite_path: Path):
 
 def check_revision_sqlite(conn):
     found = conn.execute('SELECT version_num FROM alembic_version').fetchone()
-    if not found or found[0] != '0002_v17_search_gate':
+    if not found or found[0] != '0003_v18_catalog_visibility':
         raise ValueError('SQLite source needs alembic upgrade head (V1.5 or newer)')
 
 
@@ -137,7 +137,7 @@ def copy_to_postgres(conn, url: str, *, batch_size: int = 500):
             quoted_tables = ', '.join('"' + t.name + '"' for t in tables)
             dest.execute(text(f'LOCK TABLE {quoted_tables} IN ACCESS EXCLUSIVE MODE'))
             revision = dest.execute(text('SELECT version_num FROM alembic_version')).scalar_one_or_none()
-            if revision != '0002_v17_search_gate':
+            if revision != '0003_v18_catalog_visibility':
                 raise ValueError('PostgreSQL target schema revision does not match SQLite source')
             counts = {}
             for table in tables:
