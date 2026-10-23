@@ -1,32 +1,30 @@
-"""Export interaction events in RecBole atomic .inter format.
+"""Export train-only interactions from an immutable V1.6 evaluation snapshot.
 
-RecBole is an OPTIONAL research dependency, not required to run the storefront.
-Run: PYTHONPATH=services/api python ml/prepare_recbole.py
+Unlike the deprecated direct-db export, this never includes held-out future
+labels. RecBole has its OWN internal train/validation policy; score exported
+model predictions with evaluation_cli.py for actual apples-to-apples metrics.
 """
+from __future__ import annotations
 import argparse
-import sys
-from datetime import timezone
 from pathlib import Path
-from sqlalchemy import select
+import shutil
+from evaluation_cli import load_snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'services/api'))
-from app import Event, SessionLocal  # noqa: E402
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--snapshot', type=Path, required=True)
+    parser.add_argument('--output', type=Path, default=ROOT / 'ml/data/commerce/commerce.inter')
+    args = parser.parse_args(argv)
+    split, _ = load_snapshot(args.snapshot)
+    if args.output.resolve() == (args.snapshot / 'train.inter').resolve():
+        parser.error('Cannot overwrite immutable snapshot train.inter')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(args.snapshot / 'train.inter', args.output)
+    print(f'Exported pre-cutoff training interactions to {args.output} (cutoff={split.cutoff.isoformat()})')
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--output', type=Path, default=ROOT / 'ml/data/commerce/commerce.inter')
-    args = ap.parse_args()
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    weights = {'click': 1., 'favorite': 3., 'cart': 5., 'purchase_demo': 8.}
-    count = 0
-    with SessionLocal() as db, args.output.open('w') as out:
-        out.write('user_id:token\titem_id:token\trating:float\ttimestamp:float\n')
-        for ev in db.scalars(select(Event).order_by(Event.at, Event.id)):
-            if ev.event_type not in weights:
-                continue
-            dt = ev.at.replace(tzinfo=timezone.utc) if ev.at.tzinfo is None else ev.at
-            out.write(f'{ev.visitor}\t{ev.product_id}\t{weights[ev.event_type]}\t{dt.timestamp()}\n')
-            count += 1
-    print(f'Wrote {count} records to {args.output}')
+    main()

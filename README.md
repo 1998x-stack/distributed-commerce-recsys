@@ -2,7 +2,7 @@
 
 A three-machine LAN e-commerce discovery and recommendation research project. **SQLite is the default business database**; PostgreSQL can be selected by configuration. Gorse maintains a *separate* PostgreSQL data store, because Gorse does not support SQLite as its data store.
 
-> **V1.5 migrations and live catalog updates:** [docs/ITERATION_V1_5.md](docs/ITERATION_V1_5.md). Prior **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
+> **V1.6 evaluation, database copy and LAN benchmark:** [docs/ITERATION_V1_6.md](docs/ITERATION_V1_6.md). **V1.5 migrations and live catalog updates:** [docs/ITERATION_V1_5.md](docs/ITERATION_V1_5.md). Prior **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
 ## Features
 
@@ -23,7 +23,7 @@ Ubuntu B Gorse worker/server -> Ubuntu A:8086 Gorse master
 Ubuntu A: Gorse-only PostgreSQL + Redis + OpenSearch
 ```
 
-**SQLite db files must never be NFS/SMB-shared between computers**. All business writes happen through the Mac API. Switching business DB to PostgreSQL does not migrate existing data automatically; use database migrations/export-import. Docker Compose files are local to each machine, not a cross-machine overlay network. This is a development LAN configuration, **not production HA**.
+**SQLite db files must never be NFS/SMB-shared between computers**. All business writes happen through the Mac API. Switching business DB to PostgreSQL does not migrate existing data automatically; for an offline, verified one-time copy use `scripts/migrate_sqlite_to_postgres.py` (see V1.6 guide). Docker Compose files are local to each machine, not a cross-machine overlay network. This is a development LAN configuration, **not production HA**.
 
 ## Quickstart: local API without external infrastructure
 
@@ -111,9 +111,15 @@ curl 'http://127.0.0.1:8000/api/search?q=headphones'
 - `PYTHONPATH=services/api python scripts/import_products.py --file PATH_TO_META.jsonl.gz --limit 10000`
 - Do not distribute original protected images, private user data, or third-party dataset files in Git.
 
+## V1.6 reproducible evaluation and database migration
+
+- `ml/evaluation_cli.py prepare` produces a fixed, train-only global-time snapshot; `score` checks external Gorse/RecBole prediction JSONL against the same users, candidate pool and metrics. See [V1.6 protocol](docs/ITERATION_V1_6.md).
+- `scripts/migrate_sqlite_to_postgres.py --sqlite PATH` is a **dry run**; `--execute` copies into an EMPTY separately provisioned business PostgreSQL schema with transactional verification. Stop all writers and back up SQLite before switching.
+- `scripts/bench_api.py` offers bounded read-only private LAN latency/throughput measurements; it does not replace real three-node fault-injection tests.
+
 ## Limitations
 
-V1 is a runnable research baseline, not full Taobao/JD functionality: single-node search storage, no distributed SQL, no payment system, no account login, no high-availability guarantees. `create_all` plus additive alterations still handle local schema creation and legacy upgrades; Alembic migrations are not implemented. Back up before upgrades and never run concurrent schema updaters. Gorse eventual consistency and cold-start fallbacks should be evaluated separately. See `docs/ARCHITECTURE.md`.
+V1 is a runnable research baseline, not full Taobao/JD functionality: single-node search storage, no distributed SQL, no payment system, no account login, no high-availability guarantees. Production uses versioned Alembic migrations (V1.5+); local development retains `create_all` for convenience. Back up before upgrades and never run concurrent schema updaters. Gorse eventual consistency and cold-start fallbacks should be evaluated separately. See `docs/ARCHITECTURE.md`.
 
 ### Search index rebuild in V1.2
 

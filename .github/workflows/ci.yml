@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -r services/api/requirements.txt pytest
-      - run: PYTHONPATH=services/api pytest -q tests/test_postgres_optional.py
+      - run: PYTHONPATH=services/api pytest -q tests/test_postgres_optional.py tests/test_migration_pg_optional.py
 
   compose-config:
     runs-on: ubuntu-latest
