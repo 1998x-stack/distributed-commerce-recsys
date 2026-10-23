@@ -97,12 +97,8 @@ def test_gorse_sync_retry_and_delivery(harness, monkeypatch):
         attempts.append((request.method, request.url.path, json.loads(request.content)))
         return httpx.Response(503 if failure[0] else 200, json={'RowAffected': 1})
 
-    original = httpx.AsyncClient
-
-    def factory(**kwargs):
-        return original(transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(app.httpx, 'AsyncClient', factory)
+    monkeypatch.setattr(app.app.state, 'provider_http',
+                        httpx.Client(transport=httpx.MockTransport(handler)))
     first = client.post('/api/admin/sync', headers=headers).json()
     assert first['claimed'] == 1 and first['failed'] == 1
     assert attempts[0][0:2] == ('PUT', '/api/feedback')
@@ -205,12 +201,8 @@ def test_reimport_changed_item_requeues_delivered_outbox(harness, monkeypatch):
 def test_search_provider_falls_back_when_down(harness, monkeypatch):
     app, client = harness
     app.CONFIG['services']['search'] = 'http://mock-search'
-    original = httpx.AsyncClient
-
-    def factory(**kwargs):
-        return original(transport=httpx.MockTransport(lambda request: httpx.Response(503)), **kwargs)
-
-    monkeypatch.setattr(app.httpx, 'AsyncClient', factory)
+    monkeypatch.setattr(app.app.state, 'provider_http',
+                        httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503))))
     result = client.get('/api/search', params={'q': 'Headphones'}).json()
     assert result['provider'] == 'sqlite-fts5'
     assert result['items'][0]['id'] == 'test:headphone'
@@ -307,12 +299,115 @@ def test_gorse_feedback_batches_not_one_request_per_row(harness, monkeypatch):
         client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'})
     app.CONFIG['services']['gorse'] = 'http://mock-gorse'
     requests = []
-    original = httpx.AsyncClient
     def handler(req):
         requests.append(json.loads(req.content))
         return httpx.Response(200, json={'RowAffected': len(requests[-1])})
-    monkeypatch.setattr(app.httpx, 'AsyncClient', lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
+    monkeypatch.setattr(app.app.state, 'provider_http',
+                        httpx.Client(transport=httpx.MockTransport(handler)))
     r = client.post('/api/admin/sync?batch=1000', headers={'X-Admin-Key': 'testing-admin-key'})
     assert r.status_code == 200
     assert r.json()['delivered'] == 3
     assert len(requests) == 1 and len(requests[0]) == 3
+
+
+def test_rate_limit_blocks_event_and_weighted_batch(harness, monkeypatch):
+    app, client = harness
+    from operational import TokenBuckets
+    monkeypatch.setattr(app.app.state, 'rate_limiter', TokenBuckets(capacity=2, refill_per_second=.001))
+    assert client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'}).status_code == 201
+    assert client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'}).status_code == 201
+    r = client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'})
+    assert r.status_code == 429 and r.headers['retry-after'] == '30'
+    with app.SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(app.Event)) == 2
+
+
+def test_circuit_skips_unhealthy_search_and_recovers(harness, monkeypatch):
+    app, client = harness
+    app.CONFIG['services']['search'] = 'http://search-down'
+    calls = [0]
+    failing = [True]
+    def handler(req):
+        calls[0] += 1
+        if failing[0]:
+            return httpx.Response(503)
+        return httpx.Response(200, json={'hits': {'hits': [{'_id': 'test:headphone'}]}})
+    monkeypatch.setattr(app.app.state, 'provider_http', httpx.Client(transport=httpx.MockTransport(handler)))
+    for _ in range(4):
+        assert client.get('/api/search', params={'q': 'Headphones'}).status_code == 200
+    assert calls[0] == 3
+    assert client.get('/api/admin/metrics', headers={'X-Admin-Key': 'testing-admin-key'}).json()['circuits']['search']['open']
+    # A successful half-open probe closes the circuit.
+    failing[0] = False
+    app.app.state.circuits._states['search'].open_until = 0.001
+    assert client.get('/api/search', params={'q': 'Headphones'}).json()['provider'] == 'opensearch'
+    assert calls[0] == 4
+
+
+def test_outbox_retention_prunes_only_old_delivered(harness):
+    app, client = harness
+    today = datetime.now(timezone.utc)
+    with app.SessionLocal() as db:
+        db.add_all([
+            app.Outbox(id='old-delivered', kind='item', payload='{}', delivered=True,
+                       delivered_at=today - timedelta(days=60)),
+            app.Outbox(id='recent-delivered', kind='item', payload='{}', delivered=True,
+                       delivered_at=today - timedelta(days=2)),
+            app.Outbox(id='old-pending', kind='item', payload='{}', delivered=False,
+                       delivered_at=today - timedelta(days=60)),
+        ])
+        db.commit()
+    headers = {'X-Admin-Key': 'testing-admin-key'}
+    assert client.post('/api/admin/outbox/prune?days=30', headers=headers).json()['deleted'] == 1
+    assert client.post('/api/admin/outbox/prune?days=30').status_code == 403
+    with app.SessionLocal() as db:
+        assert db.get(app.Outbox, 'old-delivered') is None
+        assert db.get(app.Outbox, 'recent-delivered') is not None
+        assert db.get(app.Outbox, 'old-pending') is not None
+
+
+def test_new_outbox_indexes_and_timestamps(harness):
+    app, client = harness
+    from sqlalchemy import inspect
+    with app.SessionLocal() as db:
+        assert {'ix_outbox_claim', 'ix_outbox_delivered_at'}.issubset(
+            {index['name'] for index in inspect(db.bind).get_indexes('outbox')})
+    assert client.post('/api/events', json={'product_id': 'test:headphone', 'event_type': 'click'}).status_code == 201
+    with app.SessionLocal() as db:
+        assert db.scalar(select(app.Outbox.created_at)) is not None
+
+
+def test_request_trace_and_fallback_metrics(harness):
+    app, client = harness
+    r = client.get('/api/search', params={'q': 'Headphones'})
+    assert r.status_code == 200
+    assert len(r.headers['X-Request-ID']) == 32
+    assert r.headers['Server-Timing'].startswith('api;dur=')
+    client.get('/api/recommendations/home')
+    metrics = client.get('/api/admin/metrics', headers={'X-Admin-Key': 'testing-admin-key'}).json()
+    assert metrics['requests']['search_sqlite_fts5'] == 1
+    assert metrics['requests']['recommend_local'] == 1
+    assert metrics['oldest_pending_seconds'] is None
+
+
+def test_historical_popularity_backfill_is_idempotent(harness, monkeypatch):
+    app, client = harness
+    # Preexisting event history does not automatically have ProductVisitor rows.
+    with app.SessionLocal() as db:
+        db.add_all([
+            app.Event(id=str(uuid.uuid4()), visitor='history-a', product_id='test:headphone', event_type='click'),
+            app.Event(id=str(uuid.uuid4()), visitor='history-a', product_id='test:headphone', event_type='favorite'),
+            app.Event(id=str(uuid.uuid4()), visitor='history-b', product_id='test:headphone', event_type='review'),
+            app.Event(id=str(uuid.uuid4()), visitor='history-c', product_id='test:speaker', event_type='impression'),
+        ])
+        db.commit()
+    monkeypatch.setitem(sys.modules, 'app', app)
+    import_path = Path(__file__).resolve().parents[1] / 'scripts/backfill_popularity.py'
+    spec = importlib.util.spec_from_file_location('popularity_backfill_' + uuid.uuid4().hex, import_path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    first = script.backfill()
+    second = script.backfill()
+    assert first == second == {'unique_product_visitors': 2, 'products_with_popularity': 1}
+    with app.SessionLocal() as db:
+        assert db.get(app.ProductStat, 'test:headphone').unique_visitors == 2

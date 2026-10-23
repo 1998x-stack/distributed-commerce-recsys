@@ -48,3 +48,34 @@ jobs:
           python-version: '3.12'
       - run: pip install -r services/api/requirements.txt pytest
       - run: PYTHONPATH=services/api pytest -q tests/test_postgres_optional.py
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate three deployment manifests
+        run: |
+          docker compose --env-file .env.example -f infra/macos/compose.yaml config --quiet
+          docker compose --env-file .env.example -f infra/ubuntu-a/compose.yaml config --quiet
+          docker compose --env-file .env.example -f infra/ubuntu-b/compose.yaml config --quiet
+  docker-api-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build hardened API image
+        run: docker build -f services/api/Dockerfile -t commerce-api-ci .
+      - name: Start non-root SQLite API and probe readiness
+        run: |
+          docker run -d --name commerce-api-ci -p 127.0.0.1:8000:8000 \
+            -e APP_ENV=production \
+            -e SESSION_SECRET="ci-only-$(printf 'x%.0s' {1..64})" \
+            -e ADMIN_KEY="ci-only-$(printf 'y%.0s' {1..64})" \
+            -e OPENSEARCH_URL= -e GORSE_URL= \
+            --mount type=volume,source=commerce_ci,target=/app/data \
+            commerce-api-ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health/ready; then exit 0; fi
+            sleep 2
+          done
+          docker logs commerce-api-ci
+          exit 1

@@ -30,6 +30,11 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     restart: unless-stopped
     volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     networks: [backend]
   opensearch:
     image: opensearchproject/opensearch:2.19.0
@@ -42,6 +47,7 @@ services:
     ports:
       - "${UBUNTU_A_IP:?Set UBUNTU_A_IP}:9200:9200"
     volumes: ["opensearch_data:/usr/share/opensearch/data"]
+    mem_limit: 3g
     ulimits:
       nofile: {soft: 65536, hard: 65536}
     networks: [backend]
@@ -63,6 +69,8 @@ services:
       - "${UBUNTU_A_IP}:8086:8086"
       - "${UBUNTU_A_IP}:8088:8088"
     networks: [backend]
+    logging:
+      options: {max-size: "10m", max-file: "3"}
 networks:
   backend: {}
 volumes:

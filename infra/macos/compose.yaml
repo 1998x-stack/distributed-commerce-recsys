@@ -1,6 +1,16 @@
 name: commerce-macos
 services:
+  # Existing V1.3 volumes may be root-owned; fix ownership before running the
+  # API as uid 10001. This one-shot job must finish before API startup.
+  volume-init:
+    image: busybox:1.36
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /data"]
+    volumes: ["commerce_data:/data"]
+    restart: "no"
   api:
+    depends_on:
+      volume-init: {condition: service_completed_successfully}
     build:
       context: ../..
       dockerfile: services/api/Dockerfile
@@ -16,6 +26,14 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS}
       APP_ENV: production
       GORSE_API_KEY: ${GORSE_API_KEY:-}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-120}
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     volumes: ["commerce_data:/app/data"]
     ports: ["127.0.0.1:8000:8000"]
     healthcheck:
@@ -37,6 +55,13 @@ services:
       API_URL: http://api:8000
       ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY}
     command: ["python", "/app/scripts/sync_gorse.py"]
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging:
+      options: {max-size: "10m", max-file: "3"}
   storefront:
     build:
       context: ../..
@@ -49,5 +74,13 @@ services:
     environment:
       API_INTERNAL_URL: http://api:8000
     ports: ["${MAC_IP:?Set MAC_IP}:3000:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    logging:
+      options: {max-size: "10m", max-file: "3"}
 volumes:
   commerce_data: {}

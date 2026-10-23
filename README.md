@@ -2,7 +2,7 @@
 
 A three-machine LAN e-commerce discovery and recommendation research project. **SQLite is the default business database**; PostgreSQL can be selected by configuration. Gorse maintains a *separate* PostgreSQL data store, because Gorse does not support SQLite as its data store.
 
-> **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
+> **V1.4 reliability:** [docs/ITERATION_V1_4.md](docs/ITERATION_V1_4.md) — HTTP reuse, circuit breakers, write throttling, safe outbox cleanup, popularity backfill and container hardening. Prior **V1.3 optimization:** [docs/ITERATION_V1_3.md](docs/ITERATION_V1_3.md) — verified fixes, upgrade notes and remaining risks. Earlier audit: [docs/OPTIMIZATION_AUDIT.md](docs/OPTIMIZATION_AUDIT.md).
 
 ## Features
 
@@ -89,7 +89,7 @@ PostgreSQL in Ubuntu A's Compose is initially **Gorse-only**, not a pre-created 
 
 ### Security
 
-This is a **LAN-only prototype**. The OpenSearch security plugin is disabled for development; never forward 9200 to the Internet. Use firewall allowlists, private Wi-Fi, and strong random session/admin secrets. Gorse upstream REST API must not be exposed to untrusted clients; only the FastAPI gateway calls it. No production auth, payments, stock, seller or checkout fulfillment is implemented. Anonymous clients cannot submit simulated purchases, but rate limiting and abuse detection remain pending. Anonymous sessions are not account authentication; do not use this as a real commerce platform.
+This is a **LAN-only prototype**. The OpenSearch security plugin is disabled for development; never forward 9200 to the Internet. Use firewall allowlists, private Wi-Fi, and strong random session/admin secrets. Gorse upstream REST API must not be exposed to untrusted clients; only the FastAPI gateway calls it. No production auth, payments, stock, seller or checkout fulfillment is implemented. Anonymous clients cannot submit simulated purchases. V1.4 adds **best-effort process-local write rate limiting** (configure `RATE_LIMIT_*` in `.env`), but durable abuse detection and authenticated user accounts remain pending. Anonymous sessions are not account authentication; do not use this as a real commerce platform.
 
 ### Verification and tests
 
@@ -110,7 +110,7 @@ curl 'http://127.0.0.1:8000/api/search?q=headphones'
 
 ## Limitations
 
-V1 is a runnable research baseline, not full Taobao/JD functionality: single-node search storage, no distributed SQL, no payment system, no account login, no high-availability guarantees. `create_all` covers first-run schema creation; use Alembic migrations before persistent production use. Gorse eventual consistency and cold-start fallbacks should be evaluated separately. See `docs/ARCHITECTURE.md`.
+V1 is a runnable research baseline, not full Taobao/JD functionality: single-node search storage, no distributed SQL, no payment system, no account login, no high-availability guarantees. `create_all` plus additive alterations still handle local schema creation and legacy upgrades; Alembic migrations are not implemented. Back up before upgrades and never run concurrent schema updaters. Gorse eventual consistency and cold-start fallbacks should be evaluated separately. See `docs/ARCHITECTURE.md`.
 
 ### Search index rebuild in V1.2
 
@@ -127,3 +127,13 @@ Local tests verify SQLite/API workflows and mocked Gorse failure handling, but n
 - Unique-visitor popularity is transactional but counts only events observed after V1.3 deployment, without historical backfill or time decay.
 - The optional review importer uses high-rated Amazon reviews as historical positives, not as an unbiased clickstream.
 - Back up the SQLite volume before the additive schema upgrade; follow [V1.3 migration notes](docs/ITERATION_V1_3.md).
+
+### V1.4: operational reliability
+
+- Gorse and OpenSearch share a pooled HTTP transport with 15-second circuit-breaker cooldown after three consecutive failures. API network + SQL calls run in threadpool handlers.
+- Visitor-scoped event/cart writes are rate-limited (429 on excess). This protects the **single-process LAN demo**, not a multi-replica public service.
+- Admin metrics include provider fallback counts, circuit state and oldest pending outbox age; responses carry `X-Request-ID` and `Server-Timing`.
+- Outbox rows have delivery timestamps and due-claim indexes. Safely delete acknowledged records using `POST /api/admin/outbox/prune?days=30` with `X-Admin-Key`; pending rows are never purged by this endpoint.
+- `scripts/backfill_popularity.py` rebuilds unique-visitor counts from historical positive feedback entirely inside SQLite/PostgreSQL. Stop writes while running.
+- Mac API and sync containers run as non-root users with read-only root filesystems; a one-shot `volume-init` handles existing data volume permissions.
+- **Before upgrading:** follow the backup, schema and migration steps in [the V1.4 guide](docs/ITERATION_V1_4.md).

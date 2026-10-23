@@ -5,12 +5,14 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import math
 import re
 from collections import defaultdict
 import os
 import secrets
 from contextlib import asynccontextmanager
+from operational import CircuitBreaker, TokenBuckets, MetricsCounters
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -143,6 +145,8 @@ class ProductStat(Base):
 
 class Outbox(Base):
     __tablename__ = 'outbox'
+    __table_args__ = (Index('ix_outbox_claim', 'delivered', 'next_attempt_at', 'lease_until'),
+                      Index('ix_outbox_delivered_at', 'delivered', 'delivered_at'))
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     kind: Mapped[str] = mapped_column(String(20))
     payload: Mapped[str] = mapped_column(Text)
@@ -153,6 +157,8 @@ class Outbox(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(36))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(String(512))
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EventInput(BaseModel):
@@ -180,6 +186,8 @@ def initialize_schema():
         'lease_owner': 'VARCHAR(36)',
         'lease_until': 'TIMESTAMP',
         'last_error': 'VARCHAR(512)',
+        'created_at': 'TIMESTAMP',
+        'delivered_at': 'TIMESTAMP',
     }
     with engine.begin() as conn:
         # Existing V1 databases created before the composite index need it too.
@@ -193,6 +201,11 @@ def initialize_schema():
         for name, datatype in required.items():
             if name not in columns:
                 conn.execute(text(f'ALTER TABLE outbox ADD COLUMN {name} {datatype}'))
+        # An index on the existing table must be added explicitly; create_all
+        # only creates indexes automatically when the table is new.
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_created_at ON outbox (created_at)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_claim ON outbox (delivered, next_attempt_at, lease_until)'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_outbox_delivered_at ON outbox (delivered, delivered_at)'))
         if DRIVER == 'sqlite':
             install_sqlite_fts(conn)
 
@@ -247,9 +260,22 @@ def product_quality(p: Product) -> float:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(application: FastAPI):
     initialize_schema()
-    yield
+    # One connection pool shared by all synchronous FastAPI workers. Endpoints
+    # use normal `def` handlers so SQLAlchemy and HTTP network I/O run in
+    # FastAPI's threadpool rather than blocking the event loop.
+    application.state.circuits = CircuitBreaker()
+    application.state.runtime_metrics = MetricsCounters()
+    application.state.rate_limiter = TokenBuckets(
+        capacity=float(os.getenv('RATE_LIMIT_BURST', '120')),
+        refill_per_second=float(os.getenv('RATE_LIMIT_PER_MINUTE', '120')) / 60,
+    )
+    with httpx.Client(timeout=httpx.Timeout(2.0, connect=0.35),
+                      limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+                      trust_env=False) as client:
+        application.state.provider_http = client
+        yield
 
 
 SECRET = os.getenv('SESSION_SECRET')
@@ -258,6 +284,8 @@ if not SECRET or SECRET.startswith(('replace-', 'development-only')):
         raise RuntimeError('Configure a strong SESSION_SECRET in production')
     SECRET = secrets.token_urlsafe(48)
     logger.warning('SESSION_SECRET absent: random ephemeral development secret; sessions reset on restart')
+if os.getenv('APP_ENV', 'development') == 'production' and (len(os.getenv('ADMIN_KEY', '')) < 32 or os.getenv('ADMIN_KEY', '').startswith('replace-')):
+    raise RuntimeError('Production ADMIN_KEY must be a non-placeholder secret of at least 32 characters')
 
 app = FastAPI(title='Distributed Commerce RecSys API', version='0.3.0', lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=SECRET, same_site='lax', max_age=365 * 24 * 3600, https_only=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
@@ -275,6 +303,20 @@ async def origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware('http')
+async def request_diagnostics(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    start = time.perf_counter()
+    response = await call_next(request)
+    ms = round((time.perf_counter() - start) * 1000, 1)
+    response.headers['X-Request-ID'] = request_id
+    response.headers['Server-Timing'] = f'api;dur={ms}'
+    # Do not log search terms, cookies or authorization headers.
+    logger.info('request id=%s method=%s status=%s latency_ms=%s',
+                request_id, request.method, response.status_code, ms)
+    return response
+
+
 def db_session():
     with SessionLocal() as db:
         yield db
@@ -284,6 +326,21 @@ def visitor(request: Request) -> str:
     if 'visitor' not in request.session:
         request.session['visitor'] = str(uuid.uuid4())
     return request.session['visitor']
+
+
+def limit_write(request: Request, who: str, cost: int = 1):
+    """Anonymous abuse throttle; process-local and not a substitute for auth."""
+    if os.getenv('RATE_LIMIT_ENABLED', 'true').lower() == 'false':
+        return
+    limiter = request.app.state.rate_limiter
+    # The visitor limit works even when all clients share the Next.js proxy IP.
+    if not limiter.allow('visitor:' + who, cost):
+        raise HTTPException(429, 'Too many write requests', headers={'Retry-After': '30'})
+    # This higher IP budget bounds rapid identity cycling; X-Forwarded-For is
+    # deliberately not trusted from an unauthenticated reverse proxy.
+    ip = request.client.host if request.client else 'unknown'
+    if not limiter.allow('ip:' + ip, cost / 8):
+        raise HTTPException(429, 'Too many requests from this address', headers={'Retry-After': '30'})
 
 
 def as_product(p: Product, detail: bool = False) -> dict:
@@ -350,24 +407,25 @@ def get_product(pid: str, db: Session = Depends(db_session)):
 
 
 @app.get('/api/search')
-async def search(q: str = Query(..., min_length=1, max_length=160), category: str = '',
+def search(request: Request, q: str = Query(..., min_length=1, max_length=160), category: str = '',
                  limit: int = Query(24, ge=1, le=100), offset: int = Query(0, ge=0, le=10000),
                  db: Session = Depends(db_session)):
     ids = []
     provider = 'sql'
     base_url = CONFIG['services']['search'].rstrip('/')
-    if base_url:
+    if base_url and request.app.state.circuits.allow('search'):
         try:
             query = {'size': limit, 'from': offset, '_source': False,
                      'query': {'bool': {'must': [{'multi_match': {
                          'query': q, 'fields': ['title^4', 'brand^2', 'description']}}],
                          'filter': ([{'term': {'category': category}}] if category else [])}}}
-            async with httpx.AsyncClient(timeout=httpx.Timeout(2, connect=0.35)) as client:
-                resp = await client.post(base_url + '/commerce-products/_search', json=query)
-                resp.raise_for_status()
-                ids = [hit['_id'] for hit in resp.json().get('hits', {}).get('hits', [])]
-                provider = 'opensearch'
+            resp = request.app.state.provider_http.post(base_url + '/commerce-products/_search', json=query)
+            resp.raise_for_status()
+            ids = [hit['_id'] for hit in resp.json().get('hits', {}).get('hits', [])]
+            provider = 'opensearch'
+            request.app.state.circuits.success('search')
         except (httpx.HTTPError, ValueError, KeyError) as exc:
+            request.app.state.circuits.failure('search')
             logger.warning('Search provider unavailable, using SQL: %s', type(exc).__name__)
     if provider == 'opensearch':
         mapped = {p.id: p for p in db.scalars(select(Product).where(Product.id.in_(ids))).all()}
@@ -395,6 +453,7 @@ async def search(q: str = Query(..., min_length=1, max_length=160), category: st
             if category:
                 stmt = stmt.where(Product.category == category)
             items = [as_product(p) for p in db.scalars(stmt.order_by(Product.rating.desc(), Product.id).offset(offset).limit(limit)).all()]
+    request.app.state.runtime_metrics.increment('search_' + provider.replace('-', '_'))
     return {'items': items, 'provider': provider, 'query': q, 'offset': offset, 'limit': limit}
 
 
@@ -419,6 +478,7 @@ def check_duplicate(db: Session, who: str, key: str, payload: EventInput):
 def record_event(payload: EventInput, request: Request, response: Response, db: Session = Depends(db_session)):
     ensure_product(db, payload.product_id)
     who = visitor(request)
+    limit_write(request, who)
     key = scoped_idempotency(who, payload.idempotency_key) if payload.idempotency_key else None
     if key and check_duplicate(db, who, key, payload):
         response.status_code = 200
@@ -447,6 +507,7 @@ def record_impressions(batch: BatchInput, request: Request, response: Response, 
     if any(ev.event_type != 'impression' or not ev.request_id or ev.position < 0 for ev in batch.events):
         raise HTTPException(422, 'Batch requires attributed impressions')
     who = visitor(request)
+    limit_write(request, who, len(batch.events))
     keys_seen = set()
     inserted = 0
     for ev in batch.events:
@@ -492,6 +553,7 @@ def add_cart(payload: CartInput, request: Request, response: Response,
              db: Session = Depends(db_session)):
     ensure_product(db, payload.product_id)
     who = visitor(request)
+    limit_write(request, who)
     key = scoped_idempotency(who, 'cart:' + idempotency_key) if idempotency_key else None
 
     def repeated():
@@ -532,6 +594,7 @@ def add_cart(payload: CartInput, request: Request, response: Response,
 @app.delete('/api/cart/{pid}')
 def remove_cart(pid: str, request: Request, db: Session = Depends(db_session)):
     who = visitor(request)
+    limit_write(request, who)
     row = db.scalar(select(Cart).where(Cart.visitor == who, Cart.product_id == pid))
     if row:
         db.delete(row)
@@ -540,18 +603,19 @@ def remove_cart(pid: str, request: Request, db: Session = Depends(db_session)):
 
 
 @app.get('/api/recommendations/home')
-async def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: Session = Depends(db_session)):
+def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: Session = Depends(db_session)):
     who = visitor(request)
     ids: list[str] = []
     base = CONFIG['services']['gorse'].rstrip('/')
-    if base:
+    if base and request.app.state.circuits.allow('gorse'):
         try:
             headers = {'X-API-Key': os.environ['GORSE_API_KEY']} if os.getenv('GORSE_API_KEY') else {}
-            async with httpx.AsyncClient(timeout=httpx.Timeout(2, connect=0.35), headers=headers) as client:
-                resp = await client.get(f'{base}/api/recommend/{who}', params={'n': limit * 4})
-                resp.raise_for_status()
-                ids = [r if isinstance(r, str) else r['Id'] for r in resp.json()]
+            resp = request.app.state.provider_http.get(f'{base}/api/recommend/{who}', params={'n': limit * 4}, headers=headers)
+            resp.raise_for_status()
+            ids = [r if isinstance(r, str) else r['Id'] for r in resp.json()]
+            request.app.state.circuits.success('gorse')
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            request.app.state.circuits.failure('gorse')
             logger.warning('Gorse unavailable, using fallback: %s', type(exc).__name__)
 
     # Keep interest history separate from impression/dedup history.
@@ -618,6 +682,7 @@ async def recommend(request: Request, limit: int = Query(12, ge=1, le=50), db: S
     sources = {source for _, source in ordered}
     strategy = 'gorse' if sources == {'gorse'} else ('gorse+rerank' if 'gorse' in sources else 'local-interest-popularity')
     request_id = str(uuid.uuid4())
+    request.app.state.runtime_metrics.increment('recommend_gorse' if 'gorse' in sources else 'recommend_local')
     return {'items': [as_product(p) for p, _ in ordered], 'strategy': strategy, 'request_id': request_id,
             'placements': [{'product_id': p.id, 'position': i, 'source': source}
                            for i, (p, source) in enumerate(ordered)]}
@@ -642,11 +707,21 @@ def similar(pid: str, limit: int = Query(8, ge=1, le=30), db: Session = Depends(
 
 @app.get('/api/admin/metrics', dependencies=[Depends(admin_key)])
 def metrics(db: Session = Depends(db_session)):
-    return {'products': db.scalar(select(func.count()).select_from(Product)), 'events': db.scalar(select(func.count()).select_from(Event)), 'pending_outbox': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered == False)), 'database': DRIVER}
+    oldest = db.scalar(select(func.min(Outbox.created_at)).where(Outbox.delivered.is_(False)))
+    # SQLite's driver returns naive UTC timestamps even for timezone-aware fields.
+    if oldest is not None and oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=timezone.utc)
+    age_seconds = max(0, int((datetime.now(timezone.utc) - oldest).total_seconds())) if oldest else None
+    return {'products': db.scalar(select(func.count()).select_from(Product)),
+            'events': db.scalar(select(func.count()).select_from(Event)),
+            'pending_outbox': db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False))),
+            'oldest_pending_seconds': age_seconds,
+            'database': DRIVER, 'circuits': app.state.circuits.status(),
+            'requests': app.state.runtime_metrics.snapshot()}
 
 
 @app.post('/api/admin/sync', dependencies=[Depends(admin_key)])
-async def sync(batch: int = Query(200, ge=1, le=1000), db: Session = Depends(db_session)):
+def sync(request: Request, batch: int = Query(200, ge=1, le=1000), db: Session = Depends(db_session)):
     url = CONFIG['services']['gorse'].rstrip('/')
     if not url:
         raise HTTPException(503, 'GORSE_URL not configured')
@@ -654,7 +729,7 @@ async def sync(batch: int = Query(200, ge=1, le=1000), db: Session = Depends(db_
     owner = str(uuid.uuid4())
     available = ((Outbox.lease_until.is_(None)) | (Outbox.lease_until < now))
     due = ((Outbox.next_attempt_at.is_(None)) | (Outbox.next_attempt_at <= now))
-    pending = select(Outbox.id).where(Outbox.delivered.is_(False), available, due).order_by(Outbox.next_attempt_at, Outbox.id).limit(batch)
+    pending = select(Outbox.id).where(Outbox.delivered.is_(False), available, due).order_by(Outbox.created_at, Outbox.id).limit(batch)
     # Atomic compare-and-swap lease works with SQLite >=3.35 and PostgreSQL.
     claimed = db.execute(update(Outbox)
         .where(Outbox.id.in_(pending), Outbox.delivered.is_(False), available, due)
@@ -670,29 +745,29 @@ async def sync(batch: int = Query(200, ge=1, le=1000), db: Session = Depends(db_
     groups: dict[str, list[Outbox]] = defaultdict(list)
     for row in rows:
         groups[row.kind].append(row)
-    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-        for kind in ('item', 'feedback'):
-            kind_rows = groups.pop(kind, [])
-            # Bound request size independently of the claim limit.
-            for start in range(0, len(kind_rows), 100):
-                chunk = kind_rows[start:start + 100]
-                try:
-                    payloads = [json.loads(row.payload) for row in chunk]
-                    if kind == 'feedback':
-                        response = await client.put(url + '/api/feedback', json=payloads)
-                    else:
-                        response = await client.post(url + '/api/items', json=payloads)
-                    response.raise_for_status()
-                    results.extend((row.id, True, '') for row in chunk)
-                except (httpx.HTTPError, ValueError) as exc:
-                    results.extend((row.id, False, str(exc)[:512]) for row in chunk)
+    client = request.app.state.provider_http
+    for kind in ('item', 'feedback'):
+        kind_rows = groups.pop(kind, [])
+        # Bound request size independently of the claim limit.
+        for start in range(0, len(kind_rows), 100):
+            chunk = kind_rows[start:start + 100]
+            try:
+                payloads = [json.loads(row.payload) for row in chunk]
+                if kind == 'feedback':
+                    result = client.put(url + '/api/feedback', json=payloads, headers=headers, timeout=10)
+                else:
+                    result = client.post(url + '/api/items', json=payloads, headers=headers, timeout=10)
+                result.raise_for_status()
+                results.extend((row.id, True, '') for row in chunk)
+            except (httpx.HTTPError, ValueError) as exc:
+                results.extend((row.id, False, str(exc)[:512]) for row in chunk)
     for other_rows in groups.values():
         results.extend((row.id, False, 'Unsupported outbox kind') for row in other_rows)
     by_id = {row.id: row for row in rows}
     for row_id, ok, error in results:
         values = {'lease_owner': None, 'lease_until': None}
         if ok:
-            values.update(delivered=True, last_error=None)
+            values.update(delivered=True, delivered_at=datetime.now(timezone.utc), last_error=None)
             sent += 1
         else:
             count = (by_id[row_id].attempts or 0) + 1
@@ -704,3 +779,14 @@ async def sync(batch: int = Query(200, ge=1, le=1000), db: Session = Depends(db_
     db.commit()
     remaining = db.scalar(select(func.count()).select_from(Outbox).where(Outbox.delivered.is_(False)))
     return {'claimed': len(claimed), 'delivered': sent, 'failed': failures, 'remaining': remaining}
+
+
+@app.post('/api/admin/outbox/prune', dependencies=[Depends(admin_key)])
+def prune_outbox(days: int = Query(30, ge=1, le=3650),
+                 limit: int = Query(1000, ge=1, le=10000), db: Session = Depends(db_session)):
+    """Delete only acknowledged rows older than the retention threshold."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    old_ids = select(Outbox.id).where(Outbox.delivered.is_(True), Outbox.delivered_at < cutoff).limit(limit)
+    deleted = db.query(Outbox).filter(Outbox.id.in_(old_ids)).delete(synchronize_session=False)
+    db.commit()
+    return {'deleted': deleted, 'retention_days': days}
